@@ -135,6 +135,27 @@ test('el renderer informa pérdida y restauración de contexto WebGL', async ({ 
   await context.close();
 });
 
+test('la óptica forward se reporta sin reemplazar el HRC', async ({ browser }) => {
+  const context = await browser.newContext();
+  const visual = await context.newPage();
+  const consoleErrors: string[] = [];
+  visual.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
+  await visual.goto('/');
+  await visual.locator('[data-impulse="3"]').click();
+  for (let index = 0; index < 9; index += 1) {
+    await visual.locator('[data-action="test-note"]').click();
+    await visual.waitForTimeout(70);
+  }
+
+  const rendererDetail = visual.locator('[data-status="webgl-detail"]');
+  await expect(rendererDetail).toContainText(/HRC (512|256)²/);
+  await expect(rendererDetail).toContainText(/óptica (high|safe|off)/);
+  expect(consoleErrors).toEqual([]);
+  await context.close();
+});
+
 test('el transcriptor polifónico carga en un Worker antes de usar el micrófono', async ({ browser }) => {
   const context = await browser.newContext();
   const visual = await context.newPage();

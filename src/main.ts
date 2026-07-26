@@ -43,6 +43,10 @@ if (panelOnly) {
     fpsAverage: 0, frameTimeP95Ms: 0, tabVisible: document.visibilityState === 'visible',
     voronoiCells: 5, packingGravityEnabled: true,
     hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 2, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
+    causticsActive: false, causticsQuality: 'high', causticsEmitterCount: 0,
+    causticsMaterialCount: 0, causticsRayCount: 0, causticsHitCount: 0,
+    causticsPointCount: 0, causticsUpdateHz: 0, causticsCpuTimeMs: 0,
+    causticsDrawCalls: 0, causticsTargetMemoryBytes: 0,
   };
   try {
     renderer = new ReactiveVisualRenderer(canvas);
@@ -62,6 +66,7 @@ if (panelOnly) {
   let lastRender = performance.now();
   let lastFpsAt = lastRender;
   let renderedFrames = 0;
+  let disposed = false;
   let lastStatusAt = 0;
   let lowFpsSince: number | null = null;
   let tabWasHidden = false;
@@ -144,11 +149,11 @@ if (panelOnly) {
           : action.mode === 2
             ? 'Impulso 02 activo: las partículas nacen abajo y se acumulan hacia arriba.'
             : action.mode === 3
-              ? 'Impulso 03 activo: cajas físicas iluminadas por HRC difuso.'
+              ? 'Impulso 03 activo: HRC difuso con espejo, vidrio y caústicas forward acotadas.'
               : action.mode === 4
                 ? 'Impulso 04 activo: agudas suman celdas Voronoi; graves las restan.'
                 : action.mode === 5
-                  ? 'Impulso 05 activo: polígonos morfológicos iluminados por HRC.'
+                  ? 'Impulso 05 activo: polígonos HRC con espejo, vidrio y caústicas forward acotadas.'
                   : `Impulso ${String(action.mode).padStart(2, '0')} todavía no está implementado.`;
         revision += 1;
       }
@@ -258,6 +263,7 @@ if (panelOnly) {
   activateScene(1);
 
   const loop = (now: number): void => {
+    if (disposed) return;
     const dt = Math.min(0.1, Math.max(0.001, (now - lastRender) / 1000));
     lastRender = now;
     const audioFrames = analyzer.takeFrames();
@@ -348,6 +354,7 @@ if (panelOnly) {
   };
   requestAnimationFrame(loop);
   window.addEventListener('beforeunload', () => {
+    disposed = true;
     document.removeEventListener('visibilitychange', onVisibilityChange);
     panel.destroy();
     unsubscribeSamples();

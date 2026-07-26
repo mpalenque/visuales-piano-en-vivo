@@ -35,6 +35,10 @@ const initialStatus: SystemStatus = {
     fpsAverage: 0, frameTimeP95Ms: 0, tabVisible: true,
     voronoiCells: 5, packingGravityEnabled: true,
     hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 2, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
+    causticsActive: false, causticsQuality: 'high', causticsEmitterCount: 0,
+    causticsMaterialCount: 0, causticsRayCount: 0, causticsHitCount: 0,
+    causticsPointCount: 0, causticsUpdateHz: 0, causticsCpuTimeMs: 0,
+    causticsDrawCalls: 0, causticsTargetMemoryBytes: 0,
   },
 };
 
@@ -283,7 +287,11 @@ export class DirectorPanel {
     const renderer = this.status.renderer;
     const resolution = renderer.width && renderer.height ? `${renderer.width}×${renderer.height}` : 'sin canvas';
     const hrcMemory = renderer.hrcTargetMemoryBytes / (1024 * 1024);
-    return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · HRC ${renderer.hrcResolution}²/${number(renderer.hrcUpdateHz, 0)} Hz/${renderer.hrcFrustumsPerFrame}F/${renderer.hrcDrawCalls} calls · ${number(hrcMemory, 0)} MB · escena ${renderer.drawCalls} calls · ${renderer.geometries}G/${renderer.textures}T`;
+    const packingOptics = this.status.impulseMode === 3 || this.status.impulseMode === 5;
+    const caustics = packingOptics
+      ? ` · óptica ${renderer.causticsQuality}/${renderer.causticsRayCount}R/${renderer.causticsHitCount}H/${number(renderer.causticsCpuTimeMs, 2)} ms`
+      : ` · óptica ${renderer.causticsQuality}`;
+    return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · HRC ${renderer.hrcResolution}²/${number(renderer.hrcUpdateHz, 0)} Hz/${renderer.hrcFrustumsPerFrame}F/${renderer.hrcDrawCalls} calls · ${number(hrcMemory, 0)} MB${caustics} · escena ${renderer.drawCalls} calls · ${renderer.geometries}G/${renderer.textures}T`;
   }
 
   private transcriberLabel(): string {
@@ -300,9 +308,9 @@ export class DirectorPanel {
 
   private impulseHint(): string {
     if (this.status.impulseMode === 2) return '02 · Cada toque nace abajo y queda acumulado, llenando hacia arriba.';
-    if (this.status.impulseMode === 3) return `03 · Amitabha HRC: emisores y rebote difuso sobre cajas físicas. Tablero cada 6 s. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.impulseMode === 3) return `03 · HRC difuso + óptica forward acotada: un espejo y un vidrio refractivo, sin post extra. Tablero cada 6 s. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     if (this.status.impulseMode === 4) return '04 · Agudas suman y graves restan. Chaser espacial: cada celda revela una vista satelital distinta.';
-    if (this.status.impulseMode === 5) return `05 · Morph + HRC: polígonos físicos, rebote difuso y cámara focal dinámica. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.impulseMode === 5) return `05 · Morph + HRC: polígonos físicos con espejo, vidrio y caústicas forward acotadas. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     return '01 · Un ataque, una partícula blanca de 3 s. Se desplaza, achica y desvanece.';
   }
 

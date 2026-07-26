@@ -129,6 +129,17 @@ export interface RendererStatus {
   hrcFrustumsPerFrame: number;
   hrcTargetMemoryBytes: number;
   hrcDrawCalls: number;
+  causticsActive: boolean;
+  causticsQuality: 'high' | 'safe' | 'off';
+  causticsEmitterCount: number;
+  causticsMaterialCount: number;
+  causticsRayCount: number;
+  causticsHitCount: number;
+  causticsPointCount: number;
+  causticsUpdateHz: number;
+  causticsCpuTimeMs: number;
+  causticsDrawCalls: number;
+  causticsTargetMemoryBytes: number;
 }
 
 export interface SystemStatus {
