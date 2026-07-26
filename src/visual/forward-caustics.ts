@@ -65,6 +65,17 @@ export interface ForwardCausticsStats {
   targetMemoryBytes: number;
 }
 
+export function forwardOpticalMaterialForIndex(
+  nonEmitterIndex: number,
+  emissive: boolean,
+): Exclude<ForwardOpticalMaterial, 'emitter'> {
+  if (emissive) return 'diffuse';
+  const cycle = Math.max(0, Math.floor(nonEmitterIndex)) % 3;
+  if (cycle === 0) return 'glass';
+  if (cycle === 1) return 'mirror';
+  return 'diffuse';
+}
+
 interface ForwardCausticsBudget {
   raysPerPair: number;
   maxPairs: number;

@@ -6,7 +6,11 @@ No hay un pase fullscreen, acumulación temporal ni render targets adicionales.
 
 ## Transporte
 
-- Como máximo hay un espejo y un vidrio activos entre los cuerpos físicos.
+- Los cuerpos no emisivos alternan vidrio, espejo y difuso para que los
+  materiales sean identificables. El vidrio tiene interior transparente y
+  borde Fresnel cian; el espejo usa bandas de cromo plateado.
+- El transporte sigue limitado a los dos materiales ópticos con mejor prioridad,
+  aunque haya más materiales visibles.
 - Para cada material se elige el emisor con mejor visibilidad angular y se
   muestrea su silueta.
 - El espejo aplica una reflexión especular.

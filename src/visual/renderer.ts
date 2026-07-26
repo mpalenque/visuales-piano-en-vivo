@@ -5,6 +5,7 @@ import forestAtlasUrl from '../assets/forest-satellite-atlas-8x8.jpg';
 import { AMITABHA_WORLD_BOUNDS, AmitabhaRadianceField, type AmitabhaBody } from './amitabha-radiance-field';
 import {
   ForwardCaustics,
+  forwardOpticalMaterialForIndex,
   type ForwardCausticsQuality,
   type ForwardOpticalBody,
   type ForwardOpticalMaterial,
@@ -46,10 +47,10 @@ const opticalMaterialCode = (
 const opticalMaterialColour = (
   material: Exclude<ForwardOpticalMaterial, 'emitter'>,
 ): number => material === 'mirror'
-  ? 0x263b68
+  ? 0xc8d5e9
   : material === 'glass'
-    ? 0x72d9e8
-    : 0x85858d;
+    ? 0x42ddff
+    : 0x77727d;
 
 interface NoteParticle {
   age: number;
@@ -674,6 +675,7 @@ export class ReactiveVisualRenderer {
           attribute vec4 aEmission;
           attribute float aOpticalKind;
           varying vec2 vPackingPosition;
+          varying vec2 vPackingLocal;
           varying vec4 vPackingEmission;
           varying float vPackingOpticalKind;
           ${morphPolygon
@@ -706,6 +708,7 @@ export class ReactiveVisualRenderer {
           '#include <project_vertex>',
           `vPackingEmission = aEmission;
           vPackingOpticalKind = aOpticalKind;
+          vPackingLocal = transformed.xy;
           #ifdef USE_INSTANCING
             vec4 packingPosition = instanceMatrix * vec4(transformed, 1.0);
           #else
@@ -720,10 +723,17 @@ export class ReactiveVisualRenderer {
           '#include <common>',
           `#include <common>
           varying vec2 vPackingPosition;
+          varying vec2 vPackingLocal;
           varying vec4 vPackingEmission;
           varying float vPackingOpticalKind;
           uniform sampler2D uPackingIrradiance;
           uniform vec4 uPackingWorldBounds;
+
+          float packingOpticalEdge() {
+            ${morphPolygon
+              ? 'return clamp(length(vPackingLocal), 0.0, 1.0);'
+              : 'return clamp(max(abs(vPackingLocal.x), abs(vPackingLocal.y)) * 2.0, 0.0, 1.0);'}
+          }
 
           vec3 applyAmitabhaLighting(vec3 baseColour) {
             if (vPackingEmission.a > 0.001) {
@@ -736,16 +746,30 @@ export class ReactiveVisualRenderer {
               clamp(fieldUv, vec2(0.001), vec2(0.999))
             ).rgb;
             if (vPackingOpticalKind > 1.5) {
-              vec3 transmitted = baseColour * (vec3(0.08) + irradiance * 0.34);
-              return transmitted + irradiance * vec3(0.08, 0.2, 0.26)
-                + vec3(0.018, 0.055, 0.072);
+              float edge = packingOpticalEdge();
+              float fresnel = pow(smoothstep(0.28, 1.0, edge), 2.2);
+              float diagonal = pow(max(
+                0.0,
+                1.0 - abs(vPackingLocal.x * 0.9 + vPackingLocal.y * 0.5 - 0.08) * 7.0
+              ), 3.0);
+              vec3 glassBody = vec3(0.012, 0.13, 0.19)
+                + irradiance * vec3(0.035, 0.13, 0.2);
+              vec3 glassRim = vec3(0.62, 0.98, 1.0)
+                + irradiance * vec3(0.08, 0.15, 0.2);
+              return mix(glassBody, glassRim, fresnel * 0.92)
+                + diagonal * vec3(0.18, 0.68, 0.9);
             }
             if (vPackingOpticalKind > 0.5) {
-              return mix(
-                baseColour * (vec3(0.07) + irradiance * 0.28),
-                irradiance * vec3(0.36, 0.48, 0.7) + vec3(0.025, 0.04, 0.075),
-                0.72
+              float edge = packingOpticalEdge();
+              float chromeWave = 0.5 + 0.5 * sin(
+                vPackingLocal.x * 3.5 - vPackingLocal.y * 5.0 + 0.7
               );
+              float chromeBand = smoothstep(0.18, 0.82, chromeWave);
+              vec3 reflectedField = irradiance.bgr * vec3(0.38, 0.48, 0.65);
+              vec3 chromeDark = vec3(0.025, 0.035, 0.065) + reflectedField * 0.35;
+              vec3 chromeBright = vec3(0.72, 0.82, 0.96) + reflectedField * 0.42;
+              return mix(chromeDark, chromeBright, chromeBand)
+                + pow(edge, 5.0) * vec3(0.22, 0.3, 0.42);
             }
             return baseColour * (vec3(0.1) + irradiance * 1.08)
               + irradiance * 0.06;
@@ -755,9 +779,13 @@ export class ReactiveVisualRenderer {
           '#include <color_fragment>',
           `#include <color_fragment>
           if (vPackingOpticalKind > 1.5) {
-            diffuseColor.a *= 0.36;
+            float glassFresnel = pow(
+              smoothstep(0.28, 1.0, packingOpticalEdge()),
+              2.2
+            );
+            diffuseColor.a *= mix(0.16, 0.86, glassFresnel);
           } else if (vPackingOpticalKind > 0.5) {
-            diffuseColor.a *= 0.88;
+            diffuseColor.a *= 0.98;
           }`,
         )
         .replace(
@@ -767,8 +795,8 @@ export class ReactiveVisualRenderer {
         );
     };
     material.customProgramCacheKey = () => morphPolygon
-      ? 'piano-forward-caustics-polygons-v1'
-      : 'piano-forward-caustics-blocks-v1';
+      ? 'piano-forward-caustics-polygons-v2-materials'
+      : 'piano-forward-caustics-blocks-v2-materials';
   }
 
   private disposeOutgoing(): void {
@@ -1001,16 +1029,11 @@ export class ReactiveVisualRenderer {
   private selectForwardOpticalMaterial(
     emissive: boolean,
   ): Exclude<ForwardOpticalMaterial, 'emitter'> {
-    if (emissive) return 'diffuse';
-    const hasMirror = this.packingBlocks.some(
-      (block) => block.opticalMaterial === 'mirror',
+    const nonEmitterIndex = this.packingBlocks.reduce(
+      (count, block) => count + (block.emissive ? 0 : 1),
+      0,
     );
-    const hasGlass = this.packingBlocks.some(
-      (block) => block.opticalMaterial === 'glass',
-    );
-    if (!hasMirror && this.blockSequence >= 4) return 'mirror';
-    if (!hasGlass && this.blockSequence >= 8) return 'glass';
-    return 'diffuse';
+    return forwardOpticalMaterialForIndex(nonEmitterIndex, emissive);
   }
 
   private packingSpawn(seed: number, strength: number, height: number): { position: ReturnType<typeof Vec2>; velocity: ReturnType<typeof Vec2> } {

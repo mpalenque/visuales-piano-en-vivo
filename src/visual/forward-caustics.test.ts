@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  forwardOpticalMaterialForIndex,
   fresnelSchlick,
   rayConvexPolygonIntersection,
   reflectDirection,
@@ -41,6 +42,14 @@ const body = (
 });
 
 describe('forward caustics optics', () => {
+  it('cycles visible glass, mirror and diffuse materials', () => {
+    expect(Array.from(
+      { length: 6 },
+      (_, index) => forwardOpticalMaterialForIndex(index, false),
+    )).toEqual(['glass', 'mirror', 'diffuse', 'glass', 'mirror', 'diffuse']);
+    expect(forwardOpticalMaterialForIndex(0, true)).toBe('diffuse');
+  });
+
   it('intersects a convex body and returns its outward normal', () => {
     const hit = rayConvexPolygonIntersection(
       { x: -2, y: 0 },

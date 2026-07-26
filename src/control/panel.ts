@@ -308,9 +308,9 @@ export class DirectorPanel {
 
   private impulseHint(): string {
     if (this.status.impulseMode === 2) return '02 · Cada toque nace abajo y queda acumulado, llenando hacia arriba.';
-    if (this.status.impulseMode === 3) return `03 · HRC difuso + óptica forward acotada: un espejo y un vidrio refractivo, sin post extra. Tablero cada 6 s. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.impulseMode === 3) return `03 · Materiales: VIDRIO = cian transparente · ESPEJO = plata/cromo · DIFUSO = gris · EMISOR = luz. HRC + óptica forward, sin post extra. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     if (this.status.impulseMode === 4) return '04 · Agudas suman y graves restan. Chaser espacial: cada celda revela una vista satelital distinta.';
-    if (this.status.impulseMode === 5) return `05 · Morph + HRC: polígonos físicos con espejo, vidrio y caústicas forward acotadas. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.impulseMode === 5) return `05 · Materiales: VIDRIO = cian transparente · ESPEJO = plata/cromo · DIFUSO = gris · EMISOR = luz. Morph + HRC + caústicas forward. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     return '01 · Un ataque, una partícula blanca de 3 s. Se desplaza, achica y desvanece.';
   }
 
