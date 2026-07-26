@@ -13,6 +13,7 @@ export interface OpticalMaterial {
 }
 
 type OpticalMaterialInput = Partial<Omit<OpticalMaterial, 'kind'>> & Pick<OpticalMaterial, 'kind'>;
+export type OpticalMaterialOverrides = Partial<Omit<OpticalMaterial, 'kind'>>;
 
 const MATERIAL_DEFAULTS: Readonly<Record<OpticalMaterialKind, OpticalMaterial>> = {
   diffuse: {
@@ -85,17 +86,25 @@ export function normalizeOpticalMaterial(input: OpticalMaterialInput): OpticalMa
   };
 }
 
-export const diffuseOpticalMaterial = (): OpticalMaterial =>
-  normalizeOpticalMaterial({ kind: 'diffuse' });
+export const diffuseOpticalMaterial = (
+  overrides: OpticalMaterialOverrides = {},
+): OpticalMaterial =>
+  normalizeOpticalMaterial({ kind: 'diffuse', ...overrides });
 
-export const transparentOpticalMaterial = (): OpticalMaterial =>
-  normalizeOpticalMaterial({ kind: 'transparent' });
+export const transparentOpticalMaterial = (
+  overrides: OpticalMaterialOverrides = {},
+): OpticalMaterial =>
+  normalizeOpticalMaterial({ kind: 'transparent', ...overrides });
 
-export const mirrorOpticalMaterial = (): OpticalMaterial =>
-  normalizeOpticalMaterial({ kind: 'mirror' });
+export const mirrorOpticalMaterial = (
+  overrides: OpticalMaterialOverrides = {},
+): OpticalMaterial =>
+  normalizeOpticalMaterial({ kind: 'mirror', ...overrides });
 
-export const glassOpticalMaterial = (): OpticalMaterial =>
-  normalizeOpticalMaterial({ kind: 'glass' });
+export const glassOpticalMaterial = (
+  overrides: OpticalMaterialOverrides = {},
+): OpticalMaterial =>
+  normalizeOpticalMaterial({ kind: 'glass', ...overrides });
 
 export const OPTICAL_MATERIAL_CODE: Readonly<Record<OpticalMaterialKind, number>> =
   Object.freeze({

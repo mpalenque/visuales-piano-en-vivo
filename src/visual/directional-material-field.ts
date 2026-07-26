@@ -4,6 +4,7 @@ import {
   type OpticalMaterialBudget,
   type OpticalQualityPreset,
 } from './optical-quality-controller';
+import type { GpuPassTimer } from './gpu-pass-timer';
 
 const MAX_BODIES = 48;
 const HIGH_OPTICAL_EXTENT = 128;
@@ -17,8 +18,7 @@ type SingleTarget = THREE.WebGLRenderTarget<THREE.Texture>;
 
 interface OpticalTargetSet {
   scene: PairTarget;
-  raw: SingleTarget;
-  resolved: SingleTarget;
+  output: SingleTarget;
 }
 
 interface OpticalTargets {
@@ -63,6 +63,12 @@ export interface DirectionalEnergyProbe {
   nonZeroPixels: number;
   centroidX: number;
   centroidY: number;
+}
+
+export interface EnergyFieldReadback {
+  width: number;
+  height: number;
+  energy: Float32Array;
 }
 
 const passVertexShader = /* glsl */ `
@@ -187,11 +193,14 @@ const directionalFragmentShader = /* glsl */ `
   uniform vec4 uWorldBounds;
   uniform int uDirectionCount;
   uniform int uMaxSteps;
+  uniform int uOpticalBodyCount;
+  uniform vec4 uOpticalBodyIds;
 
   const float TWO_PI = 6.283185307179586;
   const int MATERIAL_TRANSPARENT = 1;
   const int MATERIAL_MIRROR = 2;
   const int MATERIAL_GLASS = 3;
+  const float DIRECTIONAL_TRANSPORT_GAIN = 0.12;
 
   struct Hit {
     vec2 position;
@@ -267,6 +276,30 @@ const directionalFragmentShader = /* glsl */ `
     return 0.15 * cellExtent();
   }
 
+  float normalEpsilon(int bodyId) {
+    int bodyIndex = clamp(bodyId - 1, 0, ${MAX_BODIES - 1});
+    float halfThickness = min(
+      uBodyShape[bodyIndex].z,
+      uBodyShape[bodyIndex].w
+    );
+    return max(
+      0.0001,
+      min(0.25 * minimumStep(), 0.1 * max(halfThickness, 0.001))
+    );
+  }
+
+  float analyticHitEpsilon(int bodyId) {
+    int bodyIndex = clamp(bodyId - 1, 0, ${MAX_BODIES - 1});
+    float halfThickness = min(
+      uBodyShape[bodyIndex].z,
+      uBodyShape[bodyIndex].w
+    );
+    return max(
+      0.0002,
+      min(0.1 * minimumStep(), 0.1 * max(halfThickness, 0.002))
+    );
+  }
+
   float surfaceBias() {
     return 1.25 * cellExtent();
   }
@@ -322,7 +355,7 @@ const directionalFragmentShader = /* glsl */ `
   }
 
   vec2 analyticBodyNormal(int bodyId, vec2 point, vec2 fallback) {
-    float epsilon = max(minimumStep(), 0.0001);
+    float epsilon = normalEpsilon(bodyId);
     vec2 gradient = vec2(
       bodyDistanceById(bodyId, point + vec2(epsilon, 0.0))
         - bodyDistanceById(bodyId, point - vec2(epsilon, 0.0)),
@@ -330,6 +363,23 @@ const directionalFragmentShader = /* glsl */ `
         - bodyDistanceById(bodyId, point - vec2(0.0, epsilon))
     );
     return safeNormalize(gradient, fallback);
+  }
+
+  vec2 projectBodySurface(int bodyId, vec2 point) {
+    vec2 projected = point;
+    float epsilon = normalEpsilon(bodyId);
+    for (int iteration = 0; iteration < 2; iteration++) {
+      float distanceToBody = bodyDistanceById(bodyId, projected);
+      vec2 gradient = vec2(
+        bodyDistanceById(bodyId, projected + vec2(epsilon, 0.0))
+          - bodyDistanceById(bodyId, projected - vec2(epsilon, 0.0)),
+        bodyDistanceById(bodyId, projected + vec2(0.0, epsilon))
+          - bodyDistanceById(bodyId, projected - vec2(0.0, epsilon))
+      ) / (2.0 * epsilon);
+      projected -= distanceToBody * gradient
+        / max(dot(gradient, gradient), 1e-8);
+    }
+    return projected;
   }
 
   vec2 globalSurfaceNormal(int bodyId, vec2 point, vec2 fallback) {
@@ -416,8 +466,14 @@ const directionalFragmentShader = /* glsl */ `
         && geometry.r <= hitEpsilon()
         && distanceTravelled > minimumStep()
       ) {
-        populateHit(point, distanceTravelled, geometry, hit);
-        return true;
+        int candidateBodyId = packedBodyId(geometry.g);
+        if (
+          bodyDistanceById(candidateBodyId, point)
+            <= analyticHitEpsilon(candidateBodyId)
+        ) {
+          populateHit(point, distanceTravelled, geometry, hit);
+          return true;
+        }
       }
       distanceTravelled += exteriorAdvance(max(geometry.r, 0.0));
     }
@@ -440,11 +496,10 @@ const directionalFragmentShader = /* glsl */ `
       if (outsideWorld(point)) return false;
       float distanceToBody = bodyDistanceById(bodyId, point);
       if (stepIndex > 0 && distanceToBody >= 0.0) {
-        vec2 normal = analyticBodyNormal(bodyId, point, direction);
-        float side = dot(direction, normal) >= 0.0 ? 1.0 : -1.0;
-        escaped = point
-          + normal * side * surfaceBias()
-          + direction * minimumStep();
+        // Keep the escaped origin on the originally sampled ray. The ignored
+        // receiver ID already prevents a self-hit, so a lateral normal offset
+        // only changes which mirror/glass point the ray was targeting.
+        escaped = point + direction * minimumStep();
         return !outsideWorld(escaped);
       }
       distanceTravelled += max(
@@ -509,12 +564,16 @@ const directionalFragmentShader = /* glsl */ `
         hit.position,
         -direction
       );
+      vec2 entrySurface = projectBodySurface(hit.bodyId, hit.position);
+      outwardEntry = analyticBodyNormal(
+        hit.bodyId,
+        entrySurface,
+        outwardEntry
+      );
       vec2 entryNormal = dot(direction, outwardEntry) < 0.0
         ? outwardEntry
         : -outwardEntry;
       float interfaceBias = opticalInterfaceBias(hit.bodyId);
-      float entryDistance = bodyDistanceById(hit.bodyId, hit.position);
-      vec2 entrySurface = hit.position - outwardEntry * entryDistance;
       vec2 insideOrigin = entrySurface
         - entryNormal * interfaceBias
         + direction * interfaceBias;
@@ -544,8 +603,12 @@ const directionalFragmentShader = /* glsl */ `
       }
       if (!exited) return false;
 
-      float exitDistance = bodyDistanceById(hit.bodyId, exitPosition);
-      vec2 exitSurface = exitPosition - outwardExit * exitDistance;
+      vec2 exitSurface = projectBodySurface(hit.bodyId, exitPosition);
+      outwardExit = analyticBodyNormal(
+        hit.bodyId,
+        exitSurface,
+        outwardExit
+      );
       float exitSide = dot(direction, outwardExit) >= 0.0 ? 1.0 : -1.0;
       origin = exitSurface
         + outwardExit * exitSide * interfaceBias
@@ -661,12 +724,10 @@ const directionalFragmentShader = /* glsl */ `
       opticalHit.position,
       -incident
     );
-    float mirrorDistance = bodyDistanceById(
+    vec2 mirrorSurface = projectBodySurface(
       opticalHit.bodyId,
       opticalHit.position
     );
-    vec2 mirrorSurface = opticalHit.position
-      - outwardNormal * mirrorDistance;
     outwardNormal = analyticBodyNormal(
       opticalHit.bodyId,
       mirrorSurface,
@@ -706,6 +767,15 @@ const directionalFragmentShader = /* glsl */ `
       opticalHit.position,
       -incident
     );
+    vec2 entrySurface = projectBodySurface(
+      opticalHit.bodyId,
+      opticalHit.position
+    );
+    outwardEntry = analyticBodyNormal(
+      opticalHit.bodyId,
+      entrySurface,
+      outwardEntry
+    );
     vec2 entryNormal = dot(incident, outwardEntry) < 0.0
       ? outwardEntry
       : -outwardEntry;
@@ -716,11 +786,6 @@ const directionalFragmentShader = /* glsl */ `
     float entryCosine = clamp(-dot(incident, entryNormal), 0.0, 1.0);
     float entryTransmission = 1.0 - fresnelSchlick(entryCosine, 1.0, ior);
     float interfaceBias = opticalInterfaceBias(opticalHit.bodyId);
-    float entryDistance = bodyDistanceById(
-      opticalHit.bodyId,
-      opticalHit.position
-    );
-    vec2 entrySurface = opticalHit.position - outwardEntry * entryDistance;
     vec2 insideOrigin = entrySurface
       - entryNormal * interfaceBias
       + insideDirection * interfaceBias;
@@ -735,6 +800,12 @@ const directionalFragmentShader = /* glsl */ `
       outwardExit,
       firstInsideDistance
     )) return vec3(0.0);
+    exitPosition = projectBodySurface(opticalHit.bodyId, exitPosition);
+    outwardExit = analyticBodyNormal(
+      opticalHit.bodyId,
+      exitPosition,
+      outwardExit
+    );
 
     vec2 exitNormal = dot(insideDirection, outwardExit) < 0.0
       ? outwardExit
@@ -750,12 +821,10 @@ const directionalFragmentShader = /* glsl */ `
 
     if (!exited) {
       vec2 reflectedInside = outsideDirection;
-      float firstExitDistance = bodyDistanceById(
+      vec2 firstExitSurface = projectBodySurface(
         opticalHit.bodyId,
         exitPosition
       );
-      vec2 firstExitSurface = exitPosition
-        - outwardExit * firstExitDistance;
       vec2 secondInsideOrigin = firstExitSurface
         + exitNormal * interfaceBias
         + reflectedInside * interfaceBias;
@@ -768,6 +837,12 @@ const directionalFragmentShader = /* glsl */ `
         outwardExit,
         secondInsideDistance
       )) return vec3(0.0);
+      exitPosition = projectBodySurface(opticalHit.bodyId, exitPosition);
+      outwardExit = analyticBodyNormal(
+        opticalHit.bodyId,
+        exitPosition,
+        outwardExit
+      );
       totalInsideDistance += secondInsideDistance;
       exitNormal = dot(reflectedInside, outwardExit) < 0.0
         ? outwardExit
@@ -796,8 +871,10 @@ const directionalFragmentShader = /* glsl */ `
       * entryTransmission
       * exitTransmission;
     pathDistance += totalInsideDistance;
-    float exitDistance = bodyDistanceById(opticalHit.bodyId, exitPosition);
-    vec2 exitSurface = exitPosition - outwardExit * exitDistance;
+    vec2 exitSurface = projectBodySurface(
+      opticalHit.bodyId,
+      exitPosition
+    );
     vec2 nextOrigin = exitSurface
       - exitNormal * interfaceBias
       + outsideDirection * interfaceBias;
@@ -810,7 +887,11 @@ const directionalFragmentShader = /* glsl */ `
     );
   }
 
-  vec3 traceOpticalSample(vec2 origin, vec2 direction) {
+  vec3 traceOpticalSample(
+    vec2 origin,
+    vec2 direction,
+    int targetBodyId
+  ) {
     vec2 escapedOrigin;
     int receiverBodyId;
     if (!escapeInitialReceiver(
@@ -836,6 +917,10 @@ const directionalFragmentShader = /* glsl */ `
 
     // A direct emitter hit belongs to HRC, never to this field.
     if (isDirectEmitter(firstHit)) return vec3(0.0);
+    // Each sample has a PDF derived from the body it explicitly targets.
+    // Accepting a different directional body would assign it the wrong
+    // angular weight and creates energy jumps when packed bodies overlap.
+    if (firstHit.bodyId != targetBodyId) return vec3(0.0);
     if (firstHit.kind == MATERIAL_MIRROR) {
       return traceMirror(firstHit, direction, throughput, pathDistance);
     }
@@ -843,6 +928,100 @@ const directionalFragmentShader = /* glsl */ `
       return traceGlass(firstHit, direction, throughput, pathDistance);
     }
     return vec3(0.0);
+  }
+
+  int opticalBodyIdAt(int targetIndex) {
+    if (targetIndex == 0) {
+      return int(floor(uOpticalBodyIds.x + 0.5));
+    }
+    if (targetIndex == 1) {
+      return int(floor(uOpticalBodyIds.y + 0.5));
+    }
+    if (targetIndex == 2) {
+      return int(floor(uOpticalBodyIds.z + 0.5));
+    }
+    return int(floor(uOpticalBodyIds.w + 0.5));
+  }
+
+  vec2 targetedDirection(
+    vec2 origin,
+    int directionIndex,
+    out int targetBodyId,
+    out float quadratureWeight
+  ) {
+    int targetCount = clamp(uOpticalBodyCount, 1, ${MAX_DIRECTIONS});
+    int targetSlot = directionIndex % targetCount;
+    targetBodyId = opticalBodyIdAt(targetSlot);
+    int bodyIndex = clamp(targetBodyId - 1, 0, ${MAX_BODIES - 1});
+    vec4 shape = uBodyShape[bodyIndex];
+    vec4 frame = uBodyFrame[bodyIndex];
+
+    // Allocate all paths globally across the selected optical bodies. Repeated
+    // paths use deterministic angular strata; there is no per-pixel phase and
+    // therefore no spatial lattice.
+    int samplesForTarget = max(
+      1,
+      (uDirectionCount + targetCount - 1 - targetSlot) / targetCount
+    );
+    int targetOrdinal = directionIndex / targetCount;
+    float stratum = (
+      (float(targetOrdinal) + 0.5) / float(samplesForTarget)
+    );
+    vec2 localXAxis = vec2(frame.x, frame.y);
+    vec2 localYAxis = vec2(-frame.y, frame.x);
+    vec2 angularAxis = safeNormalize(
+      shape.xy - origin,
+      localXAxis
+    );
+    vec2 angularTangent = vec2(-angularAxis.y, angularAxis.x);
+    if (
+      bodyDistanceById(targetBodyId, origin)
+        <= analyticHitEpsilon(targetBodyId)
+    ) {
+      quadratureWeight = 0.0;
+      return angularAxis;
+    }
+    float lowAngle = 3.141592653589793;
+    float highAngle = -3.141592653589793;
+
+    int sides = int(floor(uBodyMeta[bodyIndex].x + 0.5));
+    int vertexCount = sides < 3 ? 4 : clamp(sides, 3, 8);
+    for (int vertexIndex = 0; vertexIndex < 8; vertexIndex++) {
+      if (vertexIndex >= vertexCount) break;
+      vec2 localVertex;
+      if (sides < 3) {
+        localVertex = vec2(
+          (vertexIndex & 1) == 0 ? -shape.z : shape.z,
+          (vertexIndex & 2) == 0 ? -shape.w : shape.w
+        );
+      } else {
+        float vertexAngle = TWO_PI
+          * float(vertexIndex) / float(vertexCount);
+        localVertex = vec2(cos(vertexAngle), sin(vertexAngle)) * shape.zw;
+      }
+      vec2 corner = shape.xy
+        + localXAxis * localVertex.x
+        + localYAxis * localVertex.y;
+      vec2 relative = corner - origin;
+      float relativeAngle = atan(
+        dot(relative, angularTangent),
+        dot(relative, angularAxis)
+      );
+      lowAngle = min(lowAngle, relativeAngle);
+      highAngle = max(highAngle, relativeAngle);
+    }
+
+    float angularSpan = highAngle - lowAngle;
+    if (angularSpan < 0.0001 || angularSpan >= 3.140592653589793) {
+      quadratureWeight = 0.0;
+      return angularAxis;
+    }
+    float relativeAngle = mix(lowAngle, highAngle, stratum);
+    quadratureWeight = angularSpan
+      / float(samplesForTarget)
+      * DIRECTIONAL_TRANSPORT_GAIN;
+    return angularAxis * cos(relativeAngle)
+      + angularTangent * sin(relativeAngle);
   }
 
   void main() {
@@ -865,70 +1044,27 @@ const directionalFragmentShader = /* glsl */ `
       return;
     }
 
-    float directionCount = float(max(uDirectionCount, 1));
-    ivec2 pixel = ivec2(gl_FragCoord.xy);
-    float phaseIndex = mod(float(pixel.x + pixel.y * 2), 4.0);
-    float phase = phaseIndex * 0.25 * TWO_PI / directionCount;
     vec3 radiance = vec3(0.0);
 
     for (int directionIndex = 0; directionIndex < ${MAX_DIRECTIONS}; directionIndex++) {
       if (directionIndex >= uDirectionCount) break;
-      float angle = phase
-        + TWO_PI * float(directionIndex) / directionCount;
-      vec2 direction = vec2(cos(angle), sin(angle));
-      radiance += traceOpticalSample(worldPosition, direction);
+      int targetBodyId;
+      float quadratureWeight;
+      vec2 direction = targetedDirection(
+        worldPosition,
+        directionIndex,
+        targetBodyId,
+        quadratureWeight
+      );
+      radiance += traceOpticalSample(
+        worldPosition,
+        direction,
+        targetBodyId
+      ) * quadratureWeight;
     }
 
-    // The four spatial phases are reconstructed in a separate 128²/64²
-    // resolve pass. Keep the raw estimator deliberately restrained so a
-    // newly spawned optical body cannot wash out the established HRC image.
-    radiance *= (TWO_PI / directionCount) * 0.12;
     if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
-    outColour = vec4(clamp(radiance, vec3(0.0), vec3(10.0)), 1.0);
-  }
-`;
-
-const directionalResolveFragmentShader = /* glsl */ `
-  precision highp float;
-  precision highp int;
-
-  in vec2 vUv;
-  out vec4 outColour;
-  uniform sampler2D uRawDirectional;
-
-  ivec2 clampedPixel(ivec2 pixel, ivec2 size) {
-    return clamp(pixel, ivec2(0), size - ivec2(1));
-  }
-
-  vec3 rawAt(ivec2 pixel, ivec2 size) {
-    return texelFetch(
-      uRawDirectional,
-      clampedPixel(pixel, size),
-      0
-    ).rgb;
-  }
-
-  void main() {
-    ivec2 size = textureSize(uRawDirectional, 0);
-    ivec2 pixel = ivec2(gl_FragCoord.xy);
-
-    // The raw shader rotates its ray set with phase
-    // (x + 2*y) mod 4. This symmetric five-tap kernel gives each of those
-    // four angular phases exactly the same total weight:
-    // centre=2, left/right=2, up/down=1. It is an angular reconstruction,
-    // not a full-screen cosmetic post-process, and runs only at 128²/64².
-    vec3 resolved = (
-      rawAt(pixel, size) * 2.0
-      + rawAt(pixel + ivec2(-1, 0), size) * 2.0
-      + rawAt(pixel + ivec2(1, 0), size) * 2.0
-      + rawAt(pixel + ivec2(0, -1), size)
-      + rawAt(pixel + ivec2(0, 1), size)
-    ) * 0.125;
-
-    if (any(isnan(resolved)) || any(isinf(resolved))) {
-      resolved = vec3(0.0);
-    }
-    outColour = vec4(clamp(resolved, vec3(0.0), vec3(4.0)), 1.0);
+    outColour = vec4(clamp(radiance, vec3(0.0), vec3(4.0)), 1.0);
   }
 `;
 
@@ -970,8 +1106,7 @@ const singleTarget = (extent: number): SingleTarget =>
 
 const targetSet = (extent: number): OpticalTargetSet => ({
   scene: pairTarget(extent),
-  raw: singleTarget(extent),
-  resolved: singleTarget(extent),
+  output: singleTarget(extent),
 });
 
 const makeVectorArray = (): THREE.Vector4[] =>
@@ -984,12 +1119,13 @@ export class DirectionalMaterialField {
   private readonly snapshotAlbedo = makeVectorArray();
   private readonly snapshotMeta = makeVectorArray();
   private readonly snapshotCount = { value: 0 };
+  private readonly opticalBodyCount = { value: 0 };
+  private readonly opticalBodyIds = new THREE.Vector4();
   private readonly quadGeometry = new THREE.PlaneGeometry(2, 2);
   private readonly passScene = new THREE.Scene();
   private readonly passCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly sceneMaterial: THREE.ShaderMaterial;
   private readonly directionalMaterial: THREE.ShaderMaterial;
-  private readonly directionalResolveMaterial: THREE.ShaderMaterial;
   private readonly passMesh: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private targets: OpticalTargets | null = null;
   private preset: OpticalQualityPreset = OPTICAL_QUALITY_PRESETS[5];
@@ -1016,6 +1152,7 @@ export class DirectionalMaterialField {
   constructor(
     private readonly renderer: THREE.WebGLRenderer,
     worldBounds: THREE.Vector4,
+    private readonly gpuPassTimer?: GpuPassTimer,
   ) {
     const context = renderer.getContext() as WebGL2RenderingContext;
     this.supported = renderer.capabilities.isWebGL2
@@ -1043,13 +1180,9 @@ export class DirectionalMaterialField {
       uWorldBounds: { value: worldBounds.clone() },
       uDirectionCount: { value: 0 },
       uMaxSteps: { value: 0 },
+      uOpticalBodyCount: this.opticalBodyCount,
+      uOpticalBodyIds: { value: this.opticalBodyIds },
     });
-    this.directionalResolveMaterial = makeMaterial(
-      directionalResolveFragmentShader,
-      {
-        uRawDirectional: { value: null },
-      },
-    );
     this.passMesh = new THREE.Mesh(this.quadGeometry, this.sceneMaterial);
     this.passMesh.frustumCulled = false;
     this.passScene.add(this.passMesh);
@@ -1078,7 +1211,7 @@ export class DirectionalMaterialField {
       updateEveryHrcCycles: this.preset.updateEveryHrcCycles,
       materials: this.preset.materials,
       targetMemoryBytes: this.targetMemoryBytes,
-      targetTextureCount: this.targets ? 8 : 0,
+      targetTextureCount: this.targets ? 6 : 0,
       drawCalls: this.drawCalls,
       updateHz: this.updateHz,
       requestedCycles: this.requestedCycles,
@@ -1106,8 +1239,6 @@ export class DirectionalMaterialField {
     this.passMesh.material = this.sceneMaterial;
     this.renderer.compile(this.passScene, this.passCamera);
     this.passMesh.material = this.directionalMaterial;
-    this.renderer.compile(this.passScene, this.passCamera);
-    this.passMesh.material = this.directionalResolveMaterial;
     this.renderer.compile(this.passScene, this.passCamera);
     this.passMesh.material = previousMaterial;
   }
@@ -1144,12 +1275,19 @@ export class DirectionalMaterialField {
     if (!this.ensureTargets()) return;
 
     this.copySnapshot(snapshot);
+    this.selectOpticalBodies(snapshot);
+    if (this.opticalBodyCount.value === 0) {
+      this.clearOutput();
+      return;
+    }
     const target = this.preset.resolution <= LOW_OPTICAL_EXTENT
       ? this.targets!.low
       : this.targets!.high;
     this.sceneMaterial.uniforms.uGlassEnabled.value =
       this.preset.materials === 'glass';
-    this.renderPass(this.sceneMaterial, target.scene);
+    this.measureGpuPass('optical-scene', () => {
+      this.renderPass(this.sceneMaterial, target.scene);
+    });
     this.capturedTarget = target;
     this.capturedPresetRevision = this.presetRevision;
     this.capturePending = true;
@@ -1175,15 +1313,11 @@ export class DirectionalMaterialField {
       Math.min(MAX_DIRECTIONS, this.preset.directionsPerPixel);
     this.directionalMaterial.uniforms.uMaxSteps.value =
       Math.min(MAX_STEPS, this.preset.maxStepsPerSegment);
-    this.renderPass(this.directionalMaterial, this.capturedTarget.raw);
-    this.directionalResolveMaterial.uniforms.uRawDirectional.value =
-      this.capturedTarget.raw.texture;
-    this.renderPass(
-      this.directionalResolveMaterial,
-      this.capturedTarget.resolved,
-    );
+    this.measureGpuPass('optical-march', () => {
+      this.renderPass(this.directionalMaterial, this.capturedTarget!.output);
+    });
     this.drawCalls = this.cycleDrawCalls;
-    this.outputTarget = this.capturedTarget.resolved;
+    this.outputTarget = this.capturedTarget.output;
     this.active = true;
     this.outputsCleared = false;
     this.renderedCycles += 1;
@@ -1211,8 +1345,56 @@ export class DirectionalMaterialField {
    * Explicit diagnostic readback for development/E2E only. It is never called
    * by the live render loop.
    */
+  readEnergyFieldForTest(): EnergyFieldReadback {
+    const target = this.outputTarget;
+    if (!this.supported || !target || !this.active) {
+      return { width: 0, height: 0, energy: new Float32Array(0) };
+    }
+    const { width, height } = target;
+    if (width <= 0 || height <= 0) {
+      return { width: 0, height: 0, energy: new Float32Array(0) };
+    }
+    const pixels = new Uint16Array(width * height * 4);
+    const previousTarget = this.renderer.getRenderTarget();
+    const previousCubeFace = this.renderer.getActiveCubeFace();
+    const previousMipmapLevel = this.renderer.getActiveMipmapLevel();
+    try {
+      this.renderer.readRenderTargetPixels(
+        target,
+        0,
+        0,
+        width,
+        height,
+        pixels,
+      );
+    } catch {
+      return { width: 0, height: 0, energy: new Float32Array(0) };
+    } finally {
+      this.renderer.setRenderTarget(
+        previousTarget,
+        previousCubeFace,
+        previousMipmapLevel,
+      );
+    }
+
+    const energy = new Float32Array(width * height);
+    for (let index = 0; index < energy.length; index += 1) {
+      const red = THREE.DataUtils.fromHalfFloat(pixels[index * 4]);
+      const green = THREE.DataUtils.fromHalfFloat(pixels[index * 4 + 1]);
+      const blue = THREE.DataUtils.fromHalfFloat(pixels[index * 4 + 2]);
+      const value = Math.max(0, red) + Math.max(0, green) + Math.max(0, blue);
+      energy[index] = Number.isFinite(value) ? value : 0;
+    }
+    return { width, height, energy };
+  }
+
+  /**
+   * Compact compatibility probe derived from the complete test-only field.
+   */
   readEnergyProbe(): DirectionalEnergyProbe {
-    if (!this.outputTarget || !this.active) {
+    const field = this.readEnergyFieldForTest();
+    const { width, height, energy } = field;
+    if (energy.length === 0) {
       return {
         width: 0,
         height: 0,
@@ -1223,33 +1405,19 @@ export class DirectionalMaterialField {
         centroidY: 0,
       };
     }
-    const { width, height } = this.outputTarget;
-    const pixels = new Uint16Array(width * height * 4);
-    this.renderer.readRenderTargetPixels(
-      this.outputTarget,
-      0,
-      0,
-      width,
-      height,
-      pixels,
-    );
     let sum = 0;
     let maximum = 0;
     let nonZeroPixels = 0;
     let weightedX = 0;
     let weightedY = 0;
-    for (let index = 0; index < width * height; index += 1) {
-      const red = THREE.DataUtils.fromHalfFloat(pixels[index * 4]);
-      const green = THREE.DataUtils.fromHalfFloat(pixels[index * 4 + 1]);
-      const blue = THREE.DataUtils.fromHalfFloat(pixels[index * 4 + 2]);
-      const energy = Math.max(0, red) + Math.max(0, green) + Math.max(0, blue);
-      if (!Number.isFinite(energy)) continue;
-      sum += energy;
-      maximum = Math.max(maximum, energy);
-      if (energy <= 1e-5) continue;
+    for (let index = 0; index < energy.length; index += 1) {
+      const value = energy[index];
+      sum += value;
+      maximum = Math.max(maximum, value);
+      if (value <= 1e-5) continue;
       nonZeroPixels += 1;
-      weightedX += (index % width) * energy;
-      weightedY += Math.floor(index / width) * energy;
+      weightedX += (index % width) * value;
+      weightedY += Math.floor(index / width) * value;
     }
     return {
       width,
@@ -1266,7 +1434,6 @@ export class DirectionalMaterialField {
     this.quadGeometry.dispose();
     this.sceneMaterial.dispose();
     this.directionalMaterial.dispose();
-    this.directionalResolveMaterial.dispose();
     this.disposeTargets();
   }
 
@@ -1282,6 +1449,37 @@ export class DirectionalMaterialField {
     }
   }
 
+  private selectOpticalBodies(snapshot: DirectionalBodySnapshot): void {
+    const count = Math.max(0, Math.min(MAX_BODIES, Math.floor(snapshot.count)));
+    const glassIds: number[] = [];
+    const mirrorIds: number[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const kind = Math.floor(snapshot.meta[index].y + 0.5);
+      if (kind === 3 && this.preset.materials === 'glass') {
+        glassIds.push(index + 1);
+      } else if (kind === 2) {
+        mirrorIds.push(index + 1);
+      }
+    }
+
+    // Glass is the most fragile/expensive material and is selected first when
+    // the current tier promises it. Remaining global paths go to mirrors.
+    const candidates = this.preset.materials === 'glass'
+      ? [...glassIds, ...mirrorIds]
+      : mirrorIds;
+    const selected = candidates.slice(
+      0,
+      Math.min(MAX_DIRECTIONS, this.preset.directionsPerPixel),
+    );
+    this.opticalBodyCount.value = selected.length;
+    this.opticalBodyIds.set(
+      selected[0] ?? 0,
+      selected[1] ?? 0,
+      selected[2] ?? 0,
+      selected[3] ?? 0,
+    );
+  }
+
   private ensureTargets(): boolean {
     if (this.targets) return true;
     const targets: OpticalTargets = {
@@ -1293,11 +1491,9 @@ export class DirectionalMaterialField {
     let complete = true;
     for (const target of [
       targets.high.scene,
-      targets.high.raw,
-      targets.high.resolved,
+      targets.high.output,
       targets.low.scene,
-      targets.low.raw,
-      targets.low.resolved,
+      targets.low.output,
     ]) {
       this.renderer.setRenderTarget(target);
       complete = complete
@@ -1307,11 +1503,9 @@ export class DirectionalMaterialField {
     this.renderer.setRenderTarget(previousTarget);
     if (!complete) {
       targets.high.scene.dispose();
-      targets.high.raw.dispose();
-      targets.high.resolved.dispose();
+      targets.high.output.dispose();
       targets.low.scene.dispose();
-      targets.low.raw.dispose();
-      targets.low.resolved.dispose();
+      targets.low.output.dispose();
       this.supported = false;
       return false;
     }
@@ -1321,7 +1515,7 @@ export class DirectionalMaterialField {
     this.targetMemoryBytes = (
       HIGH_OPTICAL_EXTENT * HIGH_OPTICAL_EXTENT
       + LOW_OPTICAL_EXTENT * LOW_OPTICAL_EXTENT
-    ) * bytesPerHalfFloatRgbaPixel * 4;
+    ) * bytesPerHalfFloatRgbaPixel * 3;
     this.clearAllocatedTargets();
     return true;
   }
@@ -1337,6 +1531,14 @@ export class DirectionalMaterialField {
     this.renderer.render(this.passScene, this.passCamera);
   }
 
+  private measureGpuPass(passName: string, operation: () => void): void {
+    if (this.gpuPassTimer) {
+      this.gpuPassTimer.measure(passName, operation);
+      return;
+    }
+    operation();
+  }
+
   private clearOutput(): void {
     this.capturePending = false;
     this.active = false;
@@ -1348,10 +1550,8 @@ export class DirectionalMaterialField {
     const previousAlpha = this.renderer.getClearAlpha();
     this.renderer.setClearColor(0x000000, 0);
     for (const target of [
-      this.targets.high.raw,
-      this.targets.high.resolved,
-      this.targets.low.raw,
-      this.targets.low.resolved,
+      this.targets.high.output,
+      this.targets.low.output,
     ]) {
       this.renderer.setRenderTarget(target);
       this.renderer.clear();
@@ -1369,11 +1569,9 @@ export class DirectionalMaterialField {
     this.renderer.setClearColor(0x000000, 0);
     for (const target of [
       this.targets.high.scene,
-      this.targets.high.raw,
-      this.targets.high.resolved,
+      this.targets.high.output,
       this.targets.low.scene,
-      this.targets.low.raw,
-      this.targets.low.resolved,
+      this.targets.low.output,
     ]) {
       this.renderer.setRenderTarget(target);
       this.renderer.clear();
@@ -1386,11 +1584,9 @@ export class DirectionalMaterialField {
   private disposeTargets(): void {
     if (!this.targets) return;
     this.targets.high.scene.dispose();
-    this.targets.high.raw.dispose();
-    this.targets.high.resolved.dispose();
+    this.targets.high.output.dispose();
     this.targets.low.scene.dispose();
-    this.targets.low.raw.dispose();
-    this.targets.low.resolved.dispose();
+    this.targets.low.output.dispose();
     this.targets = null;
     this.targetMemoryBytes = 0;
     this.outputTarget = null;

@@ -37,6 +37,7 @@ if (panelOnly) {
     ?? (!window.isSecureContext ? 'El micrófono requiere localhost o HTTPS; este origen no es seguro.' : null);
   let connectionNotice: string | null = null;
   let renderer: RendererInstance | null = null;
+  let transportSample: HTMLOutputElement | null = null;
   let rendererStatus: RendererStatus = {
     state: 'lost', quality: 'high', pixelRatio: 0, width: 0, height: 0,
     drawCalls: 0, geometries: 0, textures: 0, contextLosses: 0,
@@ -51,20 +52,86 @@ if (panelOnly) {
     opticalTargetTextureCount: 0, opticalDrawCalls: 0, opticalFallbackRatio: 0,
   };
   try {
-    renderer = new ReactiveVisualRenderer(canvas);
+    const searchParams = new URLSearchParams(window.location.search);
+    renderer = new ReactiveVisualRenderer(
+      canvas,
+      'high',
+      searchParams.has('transportTelemetry'),
+    );
     rendererStatus = renderer.getStatus();
-    if (new URLSearchParams(window.location.search).has('opticalTest')) {
+    if (searchParams.has('opticalTest')) {
       (
         window as Window & {
           __PIANO_OPTICAL_TEST__?: {
             readEnergy: () => ReturnType<RendererInstance['readOpticalEnergyProbeForTest']>;
+            readMetrics: () => ReturnType<RendererInstance['readTransportMetricsForTest']>;
+            readStatus: () => ReturnType<RendererInstance['getStatus']>;
+            readOpticalQuality: () => ReturnType<
+              RendererInstance['readOpticalQualityForTest']
+            >;
+            readGpuTiming: () => ReturnType<RendererInstance['readGpuTimingForTest']>;
+            resetGpuTiming: () => void;
+            resetPerformanceSample: () => void;
             setFixture: (kind: 'mirror' | 'glass' | null) => void;
+            setTransportFixture: (
+              options: Parameters<RendererInstance['setTransportFixtureForTest']>[0],
+            ) => void;
+            setBounceGain: (gain: number) => void;
           };
         }
       ).__PIANO_OPTICAL_TEST__ = {
         readEnergy: () => renderer!.readOpticalEnergyProbeForTest(),
+        readMetrics: () => renderer!.readTransportMetricsForTest(),
+        readStatus: () => renderer!.getStatus(),
+        readOpticalQuality: () => renderer!.readOpticalQualityForTest(),
+        readGpuTiming: () => renderer!.readGpuTimingForTest(),
+        resetGpuTiming: () => renderer!.resetGpuTimingForTest(),
+        resetPerformanceSample: () =>
+          renderer!.resetPerformanceSampleForTest(),
         setFixture: (kind) => renderer!.setOpticalFixtureForTest(kind),
+        setTransportFixture: (options) =>
+          renderer!.setTransportFixtureForTest(options),
+        setBounceGain: (gain) => renderer!.setHrcBounceGainForTest(gain),
       };
+      const diagnostics = document.createElement('div');
+      diagnostics.dataset.transportDiagnostics = '';
+      diagnostics.style.cssText = [
+        'position:fixed',
+        'left:12px',
+        'top:12px',
+        'z-index:1000',
+        'display:flex',
+        'gap:6px',
+        'padding:6px',
+        'background:#080811cc',
+      ].join(';');
+      diagnostics.innerHTML = `
+        <button type="button" data-transport-fixture="control">DIAG DIFUSO</button>
+        <button type="button" data-transport-fixture="mirror">DIAG ESPEJO</button>
+        <button type="button" data-transport-fixture="glass">DIAG VIDRIO</button>
+        <button type="button" data-transport-reset>MEDIR</button>
+        <output data-transport-sample></output>
+      `;
+      diagnostics.querySelector('[data-transport-fixture="control"]')
+        ?.addEventListener('click', () => renderer?.setTransportFixtureForTest({
+          name: 'mirror-law',
+          materialOverride: 'diffuse',
+        }));
+      diagnostics.querySelector('[data-transport-fixture="mirror"]')
+        ?.addEventListener('click', () => renderer?.setTransportFixtureForTest({
+          name: 'mirror-law',
+        }));
+      diagnostics.querySelector('[data-transport-fixture="glass"]')
+        ?.addEventListener('click', () => renderer?.setTransportFixtureForTest({
+          name: 'glass-prism',
+        }));
+      diagnostics.querySelector('[data-transport-reset]')
+        ?.addEventListener('click', () =>
+          renderer?.resetPerformanceSampleForTest());
+      transportSample = diagnostics.querySelector<HTMLOutputElement>(
+        '[data-transport-sample]',
+      );
+      stage.append(diagnostics);
     }
   } catch (error) {
     notice = error instanceof Error ? `No se pudo iniciar WebGL: ${error.message}` : 'No se pudo iniciar WebGL.';
@@ -326,6 +393,20 @@ if (panelOnly) {
         revision += 1;
       }
       rendererStatus = nextRendererStatus;
+      if (transportSample) {
+        transportSample.textContent = JSON.stringify({
+          fps: rendererStatus.fpsAverage,
+          p95: rendererStatus.frameTimeP95Ms,
+          quality: rendererStatus.quality,
+          hrcResolution: rendererStatus.hrcResolution,
+          hrcFrustums: rendererStatus.hrcFrustumsPerFrame,
+          opticalActive: rendererStatus.opticalActive,
+          opticalTier: rendererStatus.opticalTier,
+          opticalDrawCalls: rendererStatus.opticalDrawCalls,
+          opticalTextures: rendererStatus.opticalTargetTextureCount,
+          opticalBytes: rendererStatus.opticalTargetMemoryBytes,
+        });
+      }
       if (rendererStatus.state === 'lost') {
         rendererResourceBaseline = null;
       } else if (!rendererResourceBaseline) {
