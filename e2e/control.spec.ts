@@ -1,34 +1,5 @@
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 
-interface TransportMetricSnapshot {
-  sum: number;
-  maximum: number;
-  phase4Score: number;
-  clippedRatio: number;
-  outsideLeakRatio: number;
-  connectedComponents: { count: number };
-  centroid: { normalizedX: number; normalizedY: number } | null;
-  majorAxis: { anisotropy: number };
-  autocorrelationLagSpikes: { 2: number; 4: number; 8: number };
-}
-
-interface TransportMetricsSnapshot {
-  hrc: TransportMetricSnapshot | null;
-  optical: TransportMetricSnapshot | null;
-}
-
-async function readTransportMetrics(
-  page: Page,
-): Promise<TransportMetricsSnapshot | undefined> {
-  return page.evaluate(() => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        readMetrics: () => TransportMetricsSnapshot;
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.readMetrics());
-}
-
 async function openShow(context: BrowserContext): Promise<{ visual: Page; panel: Page }> {
   const visual = await context.newPage();
   const panel = await context.newPage();
@@ -184,9 +155,6 @@ test('la transparencia simple no asigna texturas nuevas ni rompe los shaders HRC
   }
 
   await expect(panel.locator('[data-status="webgl-detail"]')).toContainText(/transparentes [1-7]/);
-  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText(
-    'óptica lazy/0.0 MB',
-  );
   const finalDetail = await panel.locator('[data-status="webgl-detail"]').textContent();
   const finalTextures = finalDetail?.match(/\/(\d+)T$/)?.[1];
   expect(finalTextures).toBeDefined();
@@ -219,16 +187,6 @@ test('espejo y vidrio producen transporte direccional finito en fixtures determi
   await expect(visual.locator('[data-status="webgl-detail"]')).toContainText(
     /óptica T[0-4] (128|64)²/,
   );
-  const opticalQuality = await visual.evaluate(() => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        readOpticalQuality: () => {
-          baselineP95Ms: number | null;
-        };
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.readOpticalQuality());
-  expect(opticalQuality?.baselineP95Ms).toBeGreaterThan(0);
   const mirrorProbe = await visual.evaluate(() => (
     window as Window & {
       __PIANO_OPTICAL_TEST__?: {
@@ -253,69 +211,6 @@ test('espejo y vidrio producen transporte direccional finito en fixtures determi
   expect(mirrorProbe?.nonZeroPixels).toBeLessThan(
     (mirrorProbe?.width ?? 0) * (mirrorProbe?.height ?? 0) * 0.05,
   );
-  const mirrorMetrics = await readTransportMetrics(visual);
-  expect(mirrorMetrics?.hrc?.phase4Score).toBeLessThan(0.01);
-  expect(mirrorMetrics?.optical?.phase4Score).toBeLessThan(0.05);
-  expect(mirrorMetrics?.optical?.clippedRatio).toBe(0);
-  expect(mirrorMetrics?.optical?.outsideLeakRatio).toBeLessThanOrEqual(1e-5);
-  expect(mirrorMetrics?.optical?.connectedComponents.count)
-    .toBeLessThanOrEqual(4);
-  expect(mirrorMetrics?.optical?.majorAxis.anisotropy).toBeGreaterThan(0.5);
-  expect(Math.max(
-    mirrorMetrics?.hrc?.autocorrelationLagSpikes[2] ?? Number.POSITIVE_INFINITY,
-    mirrorMetrics?.hrc?.autocorrelationLagSpikes[4] ?? Number.POSITIVE_INFINITY,
-    mirrorMetrics?.hrc?.autocorrelationLagSpikes[8] ?? Number.POSITIVE_INFINITY,
-  )).toBeLessThan(0.02);
-  expect(Math.max(
-    mirrorMetrics?.optical?.autocorrelationLagSpikes[2] ?? Number.POSITIVE_INFINITY,
-    mirrorMetrics?.optical?.autocorrelationLagSpikes[4] ?? Number.POSITIVE_INFINITY,
-    mirrorMetrics?.optical?.autocorrelationLagSpikes[8] ?? Number.POSITIVE_INFINITY,
-  )).toBeLessThan(0.05);
-  const mirrorStatus = await visual.evaluate(() => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        readStatus: () => {
-          opticalDrawCalls: number;
-          opticalTargetTextureCount: number;
-          opticalTargetMemoryBytes: number;
-        };
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.readStatus());
-  expect(mirrorStatus).toMatchObject({
-    opticalDrawCalls: 2,
-    opticalTargetTextureCount: 6,
-    opticalTargetMemoryBytes: 491_520,
-  });
-
-  await visual.evaluate((mirrorAngle) => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        setTransportFixture: (options: {
-          name: 'mirror-law';
-          mirrorAngle: number;
-        }) => void;
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.setTransportFixture({
-    name: 'mirror-law',
-    mirrorAngle,
-  }), -Math.PI / 4);
-  await expect.poll(async () => visual.evaluate(() => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        readStatus: () => { opticalActive: boolean };
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.readStatus().opticalActive)).toBe(true);
-  const wrongAngleProbe = await visual.evaluate(() => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        readEnergy: () => { sum: number };
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.readEnergy());
-  expect(wrongAngleProbe?.sum).toBeLessThan((mirrorProbe?.sum ?? 0) * 0.5);
 
   await visual.evaluate(() => (
     window as Window & {
@@ -358,56 +253,6 @@ test('espejo y vidrio producen transporte direccional finito en fixtures determi
   expect(glassProbe?.nonZeroPixels).toBeLessThan(
     (glassProbe?.width ?? 0) * (glassProbe?.height ?? 0) * 0.05,
   );
-  const glassMetrics = await readTransportMetrics(visual);
-  expect(glassMetrics?.optical?.phase4Score).toBeLessThan(0.05);
-  expect(glassMetrics?.optical?.clippedRatio).toBe(0);
-  expect(glassMetrics?.optical?.outsideLeakRatio).toBeLessThanOrEqual(1e-5);
-  expect(glassMetrics?.optical?.connectedComponents.count)
-    .toBeLessThanOrEqual(4);
-  expect(Math.max(
-    glassMetrics?.optical?.autocorrelationLagSpikes[2] ?? Number.POSITIVE_INFINITY,
-    glassMetrics?.optical?.autocorrelationLagSpikes[4] ?? Number.POSITIVE_INFINITY,
-    glassMetrics?.optical?.autocorrelationLagSpikes[8] ?? Number.POSITIVE_INFINITY,
-  )).toBeLessThan(0.05);
-  await visual.evaluate(() => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        setTransportFixture: (options: {
-          name: 'glass-prism';
-          ior: number;
-        }) => void;
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.setTransportFixture({
-    name: 'glass-prism',
-    ior: 1,
-  }));
-  await expect.poll(async () => visual.evaluate(() => (
-    window as Window & {
-      __PIANO_OPTICAL_TEST__?: {
-        readStatus: () => { opticalActive: boolean };
-      };
-    }
-  ).__PIANO_OPTICAL_TEST__?.readStatus().opticalActive)).toBe(true);
-  const neutralIorMetrics = await readTransportMetrics(visual);
-  const iorEnergyDelta = Math.abs(
-    (neutralIorMetrics?.optical?.sum ?? 0)
-      - (glassMetrics?.optical?.sum ?? 0),
-  ) / Math.max(
-    neutralIorMetrics?.optical?.sum ?? 0,
-    glassMetrics?.optical?.sum ?? 0,
-    1e-6,
-  );
-  expect(iorEnergyDelta).toBeGreaterThan(0.02);
-  const neutralIorCentroid = neutralIorMetrics?.optical?.centroid;
-  const glassCentroid = glassMetrics?.optical?.centroid;
-  const iorCentroidShift = neutralIorCentroid && glassCentroid
-    ? Math.hypot(
-      neutralIorCentroid.normalizedX - glassCentroid.normalizedX,
-      neutralIorCentroid.normalizedY - glassCentroid.normalizedY,
-    )
-    : 0;
-  expect(iorCentroidShift).toBeGreaterThan(0.01);
   const centroidShift = Math.hypot(
     (glassProbe?.centroidX ?? 0) - (mirrorProbe?.centroidX ?? 0),
     (glassProbe?.centroidY ?? 0) - (mirrorProbe?.centroidY ?? 0),

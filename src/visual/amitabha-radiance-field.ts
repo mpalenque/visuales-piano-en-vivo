@@ -3,7 +3,6 @@ import {
   DirectionalMaterialField,
   type DirectionalEnergyProbe,
   type DirectionalMaterialFieldStats,
-  type EnergyFieldReadback,
 } from './directional-material-field';
 import {
   isDirectionalOpticalMaterial,
@@ -11,7 +10,6 @@ import {
   type OpticalMaterial,
 } from './optical-materials';
 import type { OpticalQualityPreset } from './optical-quality-controller';
-import type { GpuPassTimer } from './gpu-pass-timer';
 
 // WebGL2 port of Yaazarai/Volumetric-HRC's ray-extension implementation:
 // https://github.com/Yaazarai/Volumetric-HRC (Unlicense).
@@ -617,6 +615,8 @@ const displayFragmentShader = /* glsl */ `
   in vec2 vUv;
   out vec4 outColour;
   uniform sampler2D uIrradiance;
+  uniform sampler2D uDirectionalIrradiance;
+  uniform float uDirectionalEnabled;
   uniform float uDisplayRoll;
   uniform vec4 uWorldBounds;
 
@@ -648,7 +648,8 @@ const displayFragmentShader = /* glsl */ `
       || any(greaterThan(fieldUv, vec2(1.0)));
     vec3 radiance = outsideField
       ? vec3(0.0)
-      : texture(uIrradiance, fieldUv).rgb;
+      : texture(uIrradiance, fieldUv).rgb
+        + texture(uDirectionalIrradiance, fieldUv).rgb * uDirectionalEnabled;
     vec3 exposed = radiance * 1.7;
     vec3 mapped = acesToneMap(exposed);
     outColour = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
@@ -733,15 +734,11 @@ export class AmitabhaRadianceField {
   private glassCount = 0;
   readonly displayMaterial: THREE.ShaderMaterial;
 
-  constructor(
-    private readonly renderer: THREE.WebGLRenderer,
-    private readonly gpuPassTimer?: GpuPassTimer,
-  ) {
+  constructor(private readonly renderer: THREE.WebGLRenderer) {
     this.allocateTargets(HIGH_FIELD_EXTENT);
     this.directionalField = new DirectionalMaterialField(
       renderer,
       AMITABHA_WORLD_BOUNDS,
-      gpuPassTimer,
     );
     this.sceneMaterial = makeMaterial(sceneFragmentShader, {
       uBodyCount: this.bodyCount,
@@ -796,6 +793,8 @@ export class AmitabhaRadianceField {
     this.displayMaterial = new THREE.ShaderMaterial({
       uniforms: {
         uIrradiance: { value: this.fieldTargets[0].texture },
+        uDirectionalIrradiance: { value: this.fieldTargets[0].texture },
+        uDirectionalEnabled: { value: 0 },
         uDisplayRoll: { value: 0 },
         uWorldBounds: { value: AMITABHA_WORLD_BOUNDS.clone() },
       },
@@ -845,64 +844,11 @@ export class AmitabhaRadianceField {
 
   setOpticalPreset(preset: OpticalQualityPreset): void {
     this.directionalField.setPreset(preset);
+    this.updateDirectionalDisplayUniforms();
   }
 
   readDirectionalEnergyProbe(): DirectionalEnergyProbe {
     return this.directionalField.readEnergyProbe();
-  }
-
-  readDirectionalEnergyFieldForTest(): EnergyFieldReadback {
-    return this.directionalField.readEnergyFieldForTest();
-  }
-
-  setBounceGainForTest(gain: number): void {
-    this.sceneMaterial.uniforms.uBounceGain.value = Number.isFinite(gain)
-      ? Math.max(0, Math.min(1, gain))
-      : 0;
-    this.reset();
-  }
-
-  /**
-   * Complete HRC irradiance readback for deterministic tests only.
-   */
-  readIrradianceFieldForTest(): EnergyFieldReadback {
-    const target = this.fieldTargets?.[this.fieldReadIndex];
-    if (!this.initialized || !target || target.width <= 0 || target.height <= 0) {
-      return { width: 0, height: 0, energy: new Float32Array(0) };
-    }
-    const { width, height } = target;
-    const pixels = new Uint16Array(width * height * 4);
-    const previousTarget = this.renderer.getRenderTarget();
-    const previousCubeFace = this.renderer.getActiveCubeFace();
-    const previousMipmapLevel = this.renderer.getActiveMipmapLevel();
-    try {
-      this.renderer.readRenderTargetPixels(
-        target,
-        0,
-        0,
-        width,
-        height,
-        pixels,
-      );
-    } catch {
-      return { width: 0, height: 0, energy: new Float32Array(0) };
-    } finally {
-      this.renderer.setRenderTarget(
-        previousTarget,
-        previousCubeFace,
-        previousMipmapLevel,
-      );
-    }
-
-    const energy = new Float32Array(width * height);
-    for (let index = 0; index < energy.length; index += 1) {
-      const red = THREE.DataUtils.fromHalfFloat(pixels[index * 4]);
-      const green = THREE.DataUtils.fromHalfFloat(pixels[index * 4 + 1]);
-      const blue = THREE.DataUtils.fromHalfFloat(pixels[index * 4 + 2]);
-      const value = Math.max(0, red) + Math.max(0, green) + Math.max(0, blue);
-      energy[index] = Number.isFinite(value) ? value : 0;
-    }
-    return { width, height, energy };
   }
 
   setQuality(quality: 'high' | 'safe'): void {
@@ -989,9 +935,7 @@ export class AmitabhaRadianceField {
     this.renderer.setClearColor(0x000000, 0);
 
     if (!this.cycleActive) {
-      this.measureGpuPass('hrc-scene', () => {
-        this.renderSceneInputs();
-      });
+      this.renderSceneInputs();
       this.directionalField.capture(
         {
           count: this.bodyCount.value,
@@ -1009,25 +953,22 @@ export class AmitabhaRadianceField {
     }
 
     const stepCount = Math.max(1, Math.min(FRUSTUM_COUNT, Math.floor(frustaPerStep)));
-    this.measureGpuPass('hrc-propagation', () => {
-      for (
-        let step = 0;
-        step < stepCount && this.nextFrustum < FRUSTUM_COUNT;
-        step += 1
-      ) {
-        this.renderFrustum(this.nextFrustum);
-        this.nextFrustum += 1;
-      }
-    });
+    for (
+      let step = 0;
+      step < stepCount && this.nextFrustum < FRUSTUM_COUNT;
+      step += 1
+    ) {
+      this.renderFrustum(this.nextFrustum);
+      this.nextFrustum += 1;
+    }
 
     if (this.nextFrustum >= FRUSTUM_COUNT) {
       const writeIndex = 1 - this.fieldReadIndex;
-      this.measureGpuPass('hrc-fluence', () => {
-        this.renderPass(this.fluenceMaterial, this.fieldTargets[writeIndex]);
-      });
+      this.renderPass(this.fluenceMaterial, this.fieldTargets[writeIndex]);
       this.fieldReadIndex = writeIndex;
       this.directionalField.renderCaptured();
       this.displayMaterial.uniforms.uIrradiance.value = this.texture;
+      this.updateDirectionalDisplayUniforms();
       this.cycleActive = false;
       this.recordCompletedCycle();
     }
@@ -1112,14 +1053,6 @@ export class AmitabhaRadianceField {
     this.renderer.render(this.passScene, this.passCamera);
   }
 
-  private measureGpuPass(passName: string, operation: () => void): void {
-    if (this.gpuPassTimer) {
-      this.gpuPassTimer.measure(passName, operation);
-      return;
-    }
-    operation();
-  }
-
   private clearTargets(): void {
     const previousTarget = this.renderer.getRenderTarget();
     const previousColour = this.renderer.getClearColor(new THREE.Color()).clone();
@@ -1139,6 +1072,7 @@ export class AmitabhaRadianceField {
     this.renderer.setClearColor(previousColour, previousAlpha);
     this.fieldReadIndex = 0;
     this.displayMaterial.uniforms.uIrradiance.value = this.texture;
+    this.updateDirectionalDisplayUniforms();
     this.initialized = true;
   }
 
@@ -1206,6 +1140,15 @@ export class AmitabhaRadianceField {
     this.fluenceMaterial.uniforms.uFrustum2.value = this.frustumTargets[2].texture;
     this.fluenceMaterial.uniforms.uFrustum3.value = this.frustumTargets[3].texture;
     this.displayMaterial.uniforms.uIrradiance.value = this.fieldTargets[0].texture;
+    this.updateDirectionalDisplayUniforms();
+  }
+
+  private updateDirectionalDisplayUniforms(): void {
+    const directionalTexture = this.directionalField.texture;
+    this.displayMaterial.uniforms.uDirectionalIrradiance.value =
+      directionalTexture ?? this.texture;
+    this.displayMaterial.uniforms.uDirectionalEnabled.value =
+      directionalTexture && this.directionalField.stats.active ? 1 : 0;
   }
 
   private recordCompletedCycle(): void {
