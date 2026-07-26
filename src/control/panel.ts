@@ -33,14 +33,8 @@ const initialStatus: SystemStatus = {
     state: 'ready', quality: 'high', pixelRatio: 1, width: 0, height: 0,
     drawCalls: 0, geometries: 0, textures: 0, contextLosses: 0,
     fpsAverage: 0, frameTimeP95Ms: 0, tabVisible: true,
-    voronoiCells: 5, packingGravityEnabled: true, packingTransparentCount: 0,
-    packingMirrorCount: 0, packingGlassCount: 0,
+    voronoiCells: 5, packingGravityEnabled: true,
     hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 2, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
-    opticalSupported: false, opticalAllocated: false, opticalActive: false,
-    opticalTier: 5, opticalResolution: 0, opticalDirectionsPerPixel: 0,
-    opticalMaxStepsPerSegment: 0, opticalUpdateEveryHrcCycles: 0,
-    opticalMaterials: 'off', opticalUpdateHz: 0, opticalTargetMemoryBytes: 0,
-    opticalTargetTextureCount: 0, opticalDrawCalls: 0, opticalFallbackRatio: 0,
   },
 };
 
@@ -289,15 +283,7 @@ export class DirectorPanel {
     const renderer = this.status.renderer;
     const resolution = renderer.width && renderer.height ? `${renderer.width}×${renderer.height}` : 'sin canvas';
     const hrcMemory = renderer.hrcTargetMemoryBytes / (1024 * 1024);
-    const opticalMemory = renderer.opticalTargetMemoryBytes / (1024 * 1024);
-    const optical = !renderer.opticalSupported
-      ? 'óptica no disponible'
-      : renderer.opticalActive
-        ? `óptica T${renderer.opticalTier} ${renderer.opticalResolution}²/${renderer.opticalDirectionsPerPixel}D/${renderer.opticalMaxStepsPerSegment}S/${number(renderer.opticalUpdateHz, 0)} Hz/${renderer.opticalDrawCalls} calls`
-        : renderer.opticalAllocated
-          ? `óptica T${renderer.opticalTier} en espera`
-          : 'óptica lazy';
-    return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · HRC ${renderer.hrcResolution}²/${number(renderer.hrcUpdateHz, 0)} Hz/${renderer.hrcFrustumsPerFrame}F/${renderer.hrcDrawCalls} calls · ${number(hrcMemory, 0)} MB · ${optical}/${number(opticalMemory, 1)} MB · transparentes ${renderer.packingTransparentCount} · espejos ${renderer.packingMirrorCount} · vidrios ${renderer.packingGlassCount} · escena ${renderer.drawCalls} calls · ${renderer.geometries}G/${renderer.textures}T`;
+    return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · HRC ${renderer.hrcResolution}²/${number(renderer.hrcUpdateHz, 0)} Hz/${renderer.hrcFrustumsPerFrame}F/${renderer.hrcDrawCalls} calls · ${number(hrcMemory, 0)} MB · escena ${renderer.drawCalls} calls · ${renderer.geometries}G/${renderer.textures}T`;
   }
 
   private transcriberLabel(): string {
@@ -314,9 +300,9 @@ export class DirectorPanel {
 
   private impulseHint(): string {
     if (this.status.impulseMode === 2) return '02 · Cada toque nace abajo y queda acumulado, llenando hacia arriba.';
-    if (this.status.impulseMode === 3) return `03 · Amitabha HRC: emisores, transparencia y hasta dos espejos direccionales. Tablero cada 6 s. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.impulseMode === 3) return `03 · Amitabha HRC: emisores y rebote difuso sobre cajas físicas. Tablero cada 6 s. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     if (this.status.impulseMode === 4) return '04 · Agudas suman y graves restan. Chaser espacial: cada celda revela una vista satelital distinta.';
-    if (this.status.impulseMode === 5) return `05 · Morph + HRC: rebote difuso, espejo y un vidrio refractivo con caústicas 2D. Cámara focal dinámica. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.impulseMode === 5) return `05 · Morph + HRC: polígonos físicos, rebote difuso y cámara focal dinámica. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     return '01 · Un ataque, una partícula blanca de 3 s. Se desplaza, achica y desvanece.';
   }
 

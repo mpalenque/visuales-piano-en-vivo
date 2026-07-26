@@ -124,28 +124,11 @@ export interface RendererStatus {
   tabVisible: boolean;
   voronoiCells: number;
   packingGravityEnabled: boolean;
-  packingTransparentCount: number;
-  packingMirrorCount: number;
-  packingGlassCount: number;
   hrcResolution: number;
   hrcUpdateHz: number;
   hrcFrustumsPerFrame: number;
   hrcTargetMemoryBytes: number;
   hrcDrawCalls: number;
-  opticalSupported: boolean;
-  opticalAllocated: boolean;
-  opticalActive: boolean;
-  opticalTier: number;
-  opticalResolution: number;
-  opticalDirectionsPerPixel: number;
-  opticalMaxStepsPerSegment: number;
-  opticalUpdateEveryHrcCycles: number;
-  opticalMaterials: 'glass' | 'mirror' | 'off';
-  opticalUpdateHz: number;
-  opticalTargetMemoryBytes: number;
-  opticalTargetTextureCount: number;
-  opticalDrawCalls: number;
-  opticalFallbackRatio: number;
 }
 
 export interface SystemStatus {

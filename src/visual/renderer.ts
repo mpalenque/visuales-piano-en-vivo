@@ -3,19 +3,6 @@ import { Box, Edge, Polygon, Vec2, World } from 'planck-js';
 import type { DetectedNote, GestureEvent, ImpulseMode, RendererStatus, VisualFrame } from '../types';
 import forestAtlasUrl from '../assets/forest-satellite-atlas-8x8.jpg';
 import { AMITABHA_WORLD_BOUNDS, AmitabhaRadianceField, type AmitabhaBody } from './amitabha-radiance-field';
-import {
-  diffuseOpticalMaterial,
-  glassOpticalMaterial,
-  mirrorOpticalMaterial,
-  opticalMaterialCode,
-  packingOpticalMaterial,
-  scheduledDirectionalPackingMaterial,
-  type OpticalMaterial,
-} from './optical-materials';
-import {
-  OpticalQualityController,
-  opticalQualityPreset,
-} from './optical-quality-controller';
 import { polygonSidesForSound, regulatedPackingChaos } from './packing-dynamics';
 import { visualProfileById } from './profiles';
 import { MAX_VORONOI_CELLS, VoronoiField, type VoronoiCellSnapshot } from './voronoi-field';
@@ -45,23 +32,6 @@ const pseudoRandom = (seed: number): number => {
   const value = Math.sin(seed * 12.9898) * 43758.5453;
   return value - Math.floor(value);
 };
-const FLOOR_OPTICAL_MATERIAL = diffuseOpticalMaterial();
-const MIRROR_OPTICAL_MATERIAL = mirrorOpticalMaterial();
-const GLASS_OPTICAL_MATERIAL = glassOpticalMaterial();
-
-const writeOpticalInstance = (
-  target: Float32Array,
-  index: number,
-  material: OpticalMaterial,
-): void => {
-  const offset = index * 4;
-  target[offset] = material.tint[0];
-  target[offset + 1] = material.tint[1];
-  target[offset + 2] = material.tint[2];
-  // Integer part = material kind; fractional quarter = visible opacity.
-  target[offset + 3] = opticalMaterialCode(material) + material.opacity * 0.25;
-};
-
 interface NoteParticle {
   age: number;
   note: DetectedNote;
@@ -101,7 +71,6 @@ interface PackingBlock {
   emissionGreen: number;
   emissionBlue: number;
   emissionStrength: number;
-  opticalMaterial: OpticalMaterial;
   transportOrder: number;
 }
 
@@ -200,7 +169,7 @@ const voronoiFragmentShader = /* glsl */ `
     forest = pow(forest, vec3(0.76));
     forest *= chase * pulse * uForestExposure;
 
-    // A restrained reflected glow gives the travelling image a readable tail.
+    // A restrained trailing glow gives the travelling image a readable tail.
     float edgeHalo = 1.0 - smoothstep(cellWidth * 1.2, cellWidth * 6.0, edgeGap);
     forest *= 1.0 + edgeHalo * chase * 0.22;
 
@@ -251,8 +220,6 @@ export class ReactiveVisualRenderer {
   private readonly accumulationPoints = new THREE.Points(this.accumulationGeometry, this.accumulationMaterial);
   private accumulationParticles: AccumulationParticle[] = [];
   private readonly packingIrradiance = { value: null as THREE.Texture | null };
-  private readonly packingDirectionalIrradiance = { value: null as THREE.Texture | null };
-  private readonly packingDirectionalEnabled = { value: 0 };
   private readonly blockGeometry = new THREE.PlaneGeometry(1, 1);
   private readonly blockMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.97, depthWrite: false });
   private readonly polygonMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.97, depthWrite: false });
@@ -262,9 +229,7 @@ export class ReactiveVisualRenderer {
   private readonly polygonMorphSeeds = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS));
   private readonly polygonMorphAmounts = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS));
   private readonly blockEmissionData = new Float32Array(MAX_PACKING_BLOCKS * 4);
-  private readonly blockOpticalData = new Float32Array(MAX_PACKING_BLOCKS * 4);
   private readonly polygonEmissionData = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS * 4));
-  private readonly polygonOpticalData = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS * 4));
   private readonly polygonMeshes = this.polygonGeometries.map((geometry) => new THREE.InstancedMesh(geometry, this.polygonMaterial, MAX_PACKING_BLOCKS));
   private readonly amitabhaField: AmitabhaRadianceField;
   private readonly amitabhaDisplay: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
@@ -296,12 +261,6 @@ export class ReactiveVisualRenderer {
   private hrcSlowElapsed = 0;
   private hrcStableElapsed = 0;
   private hrcQuality: RendererStatus['quality'] = 'high';
-  private readonly opticalQualityController = new OpticalQualityController();
-  private opticalBaselineP95Ms: number | null = null;
-  private opticalBaselineElapsed = 0;
-  private opticalBaselineAccumulator = 0;
-  private opticalBaselineSamples = 0;
-  private opticalFixtureForTest: 'mirror' | 'glass' | null = null;
   private modeFiveCameraPhase: 'idle' | 'focus' | 'return' = 'idle';
   private modeFiveCameraElapsed = 0;
   private modeFiveCameraDelay = 4.2;
@@ -375,10 +334,8 @@ export class ReactiveVisualRenderer {
     this.renderer.setClearColor(0x030307, 1);
     this.amitabhaField = new AmitabhaRadianceField(this.renderer);
     this.amitabhaField.setQuality(this.quality);
-    this.amitabhaField.setOpticalPreset(opticalQualityPreset(5));
     this.amitabhaDisplay = this.amitabhaField.createDisplayMesh();
     this.packingIrradiance.value = this.amitabhaField.texture;
-    this.packingDirectionalIrradiance.value = this.amitabhaField.texture;
     this.camera.position.z = 8.5;
     this.forestTexture = new THREE.TextureLoader().load(forestAtlasUrl);
     this.forestTexture.colorSpace = THREE.SRGBColorSpace;
@@ -442,12 +399,10 @@ export class ReactiveVisualRenderer {
     this.accumulationGeometry.setDrawRange(0, 0);
     this.scene.add(this.accumulationPoints);
     this.blockGeometry.setAttribute('aEmission', new THREE.InstancedBufferAttribute(this.blockEmissionData, 4));
-    this.blockGeometry.setAttribute('aOptical', new THREE.InstancedBufferAttribute(this.blockOpticalData, 4));
     this.polygonGeometries.forEach((geometry, index) => {
       geometry.setAttribute('aMorphSeed', new THREE.InstancedBufferAttribute(this.polygonMorphSeeds[index], 1));
       geometry.setAttribute('aMorphAmount', new THREE.InstancedBufferAttribute(this.polygonMorphAmounts[index], 1));
       geometry.setAttribute('aEmission', new THREE.InstancedBufferAttribute(this.polygonEmissionData[index], 4));
-      geometry.setAttribute('aOptical', new THREE.InstancedBufferAttribute(this.polygonOpticalData[index], 4));
     });
     this.packingGroup.add(this.amitabhaDisplay);
     this.blockMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -540,12 +495,8 @@ export class ReactiveVisualRenderer {
     this.updateTransportQuality(dt);
     if (this.restorePending) {
       this.amitabhaField.reset();
-      this.opticalQualityController.reset();
-      this.resetOpticalBaseline();
       this.resetFrameTimingWindow();
       this.packingIrradiance.value = this.amitabhaField.texture;
-      this.packingDirectionalIrradiance.value = this.amitabhaField.texture;
-      this.packingDirectionalEnabled.value = 0;
       this.renderer.compile(this.scene, this.camera);
       this.resize();
       this.restorePending = false;
@@ -625,18 +576,6 @@ export class ReactiveVisualRenderer {
 
   getStatus(): RendererStatus {
     const canvas = this.renderer.domElement;
-    const optical = this.amitabhaField.stats.optical;
-    const opticalRequests = Math.max(1, optical.requestedCycles);
-    let transparentCount = 0;
-    let mirrorCount = 0;
-    let glassCount = 0;
-    for (const block of this.packingBlocks) {
-      if (block.opticalMaterial.kind === 'transparent') transparentCount += 1;
-      else if (block.opticalMaterial.kind === 'mirror') mirrorCount += 1;
-      else if (block.opticalMaterial.kind === 'glass') glassCount += 1;
-    }
-    if (this.opticalFixtureForTest === 'mirror') mirrorCount += 1;
-    if (this.opticalFixtureForTest === 'glass') glassCount += 1;
     return {
       state: this.contextState,
       quality: this.quality,
@@ -652,31 +591,11 @@ export class ReactiveVisualRenderer {
       tabVisible: document.visibilityState === 'visible',
       voronoiCells: this.voronoiField.count,
       packingGravityEnabled: this.packingGravityEnabled,
-      packingTransparentCount: transparentCount,
-      packingMirrorCount: mirrorCount,
-      packingGlassCount: glassCount,
       hrcResolution: this.amitabhaField.stats.resolution,
       hrcUpdateHz: this.amitabhaField.stats.updateHz,
       hrcFrustumsPerFrame: this.amitabhaField.stats.frustumsPerFrame,
       hrcTargetMemoryBytes: this.amitabhaField.stats.targetMemoryBytes,
       hrcDrawCalls: this.amitabhaField.stats.drawCalls,
-      opticalSupported: optical.supported,
-      opticalAllocated: optical.allocated,
-      opticalActive: optical.active,
-      opticalTier: this.opticalQualityController.stats.tier,
-      opticalResolution: optical.resolution,
-      opticalDirectionsPerPixel: optical.directionsPerPixel,
-      opticalMaxStepsPerSegment: optical.maxStepsPerSegment,
-      opticalUpdateEveryHrcCycles: optical.updateEveryHrcCycles,
-      opticalMaterials: optical.materials,
-      opticalUpdateHz: optical.updateHz,
-      opticalTargetMemoryBytes: optical.targetMemoryBytes,
-      opticalTargetTextureCount: optical.targetTextureCount,
-      opticalDrawCalls: optical.drawCalls,
-      opticalFallbackRatio: Math.max(
-        0,
-        optical.requestedCycles - optical.renderedCycles,
-      ) / opticalRequests,
     };
   }
 
@@ -685,10 +604,7 @@ export class ReactiveVisualRenderer {
     this.quality = quality;
     this.applyQuality();
     this.hrcQuality = quality;
-    this.opticalQualityController.reset();
-    this.resetOpticalBaseline();
     this.resetFrameTimingWindow();
-    this.amitabhaField.setOpticalPreset(opticalQualityPreset(5));
     this.amitabhaField.setQuality(quality);
     this.resize();
   }
@@ -697,27 +613,9 @@ export class ReactiveVisualRenderer {
     this.clearPackingBlocks();
   }
 
-  readOpticalEnergyProbeForTest(): ReturnType<
-    AmitabhaRadianceField['readDirectionalEnergyProbe']
-  > {
-    return this.amitabhaField.readDirectionalEnergyProbe();
-  }
-
-  setOpticalFixtureForTest(kind: 'mirror' | 'glass' | null): void {
-    this.opticalFixtureForTest = kind;
-    this.opticalQualityController.reset();
-    this.resetOpticalBaseline();
-    this.resetFrameTimingWindow();
-    this.amitabhaField.reset();
-  }
-
   private configurePackingMaterial(material: THREE.MeshBasicMaterial, morphPolygon: boolean): void {
     material.onBeforeCompile = (shader) => {
       shader.uniforms.uPackingIrradiance = this.packingIrradiance;
-      shader.uniforms.uPackingDirectionalIrradiance =
-        this.packingDirectionalIrradiance;
-      shader.uniforms.uPackingDirectionalEnabled =
-        this.packingDirectionalEnabled;
       shader.uniforms.uPackingWorldBounds = { value: AMITABHA_WORLD_BOUNDS.clone() };
       if (morphPolygon) shader.uniforms.uMorphTime = this.polygonMorphTime;
 
@@ -726,13 +624,8 @@ export class ReactiveVisualRenderer {
           '#include <common>',
           `#include <common>
           attribute vec4 aEmission;
-          attribute vec4 aOptical;
           varying vec2 vPackingPosition;
-          varying vec2 vPackingLocal;
-          varying vec2 vPackingOpticalNormal;
-          varying float vPackingHalfThickness;
           varying vec4 vPackingEmission;
-          varying vec4 vPackingOptical;
           ${morphPolygon
             ? `attribute float aMorphSeed;
           attribute float aMorphAmount;
@@ -762,23 +655,10 @@ export class ReactiveVisualRenderer {
         .replace(
           '#include <project_vertex>',
           `vPackingEmission = aEmission;
-          vPackingOptical = aOptical;
-          vPackingLocal = transformed.xy;
           #ifdef USE_INSTANCING
             vec4 packingPosition = instanceMatrix * vec4(transformed, 1.0);
-            vec2 packingAxisX = instanceMatrix[0].xy;
-            vec2 packingAxisY = instanceMatrix[1].xy;
-            float packingAxisXLength = length(packingAxisX);
-            float packingAxisYLength = length(packingAxisY);
-            vPackingOpticalNormal = length(packingAxisX) >= length(packingAxisY)
-              ? normalize(packingAxisY)
-              : normalize(packingAxisX);
-            vPackingHalfThickness = ${morphPolygon ? '1.0' : '0.5'}
-              * min(packingAxisXLength, packingAxisYLength);
           #else
             vec4 packingPosition = vec4(transformed, 1.0);
-            vPackingOpticalNormal = vec2(0.0, 1.0);
-            vPackingHalfThickness = 0.5;
           #endif
           vPackingPosition = packingPosition.xy;
           #include <project_vertex>`,
@@ -789,23 +669,9 @@ export class ReactiveVisualRenderer {
           '#include <common>',
           `#include <common>
           varying vec2 vPackingPosition;
-          varying vec2 vPackingLocal;
-          varying vec2 vPackingOpticalNormal;
-          varying float vPackingHalfThickness;
           varying vec4 vPackingEmission;
-          varying vec4 vPackingOptical;
           uniform sampler2D uPackingIrradiance;
-          uniform sampler2D uPackingDirectionalIrradiance;
-          uniform float uPackingDirectionalEnabled;
           uniform vec4 uPackingWorldBounds;
-
-          float packingOpticalKind() {
-            return floor(vPackingOptical.a + 0.0001);
-          }
-
-          float packingOpticalOpacity() {
-            return clamp(fract(vPackingOptical.a) * 4.0, 0.0, 1.0);
-          }
 
           vec3 applyAmitabhaLighting(vec3 baseColour) {
             if (vPackingEmission.a > 0.001) {
@@ -817,92 +683,9 @@ export class ReactiveVisualRenderer {
               uPackingIrradiance,
               clamp(fieldUv, vec2(0.001), vec2(0.999))
             ).rgb;
-            vec3 directional = texture2D(
-              uPackingDirectionalIrradiance,
-              clamp(fieldUv, vec2(0.001), vec2(0.999))
-            ).rgb * uPackingDirectionalEnabled;
-            float opticalKind = packingOpticalKind();
-            float localExtent = ${morphPolygon ? '1.0' : '0.5'};
-            float edgeCoordinate = max(
-              abs(vPackingLocal.x),
-              abs(vPackingLocal.y)
-            ) / localExtent;
-            float rim = smoothstep(0.72, 1.0, edgeCoordinate);
-
-            if (opticalKind > 1.5 && opticalKind < 2.5) {
-              vec2 fieldSpan = uPackingWorldBounds.zw - uPackingWorldBounds.xy;
-              vec2 normalUv = vPackingOpticalNormal / fieldSpan;
-              float outsideOffset = vPackingHalfThickness * 2.0 + 0.08;
-              vec3 reflectedA = texture2D(
-                uPackingIrradiance,
-                clamp(
-                  fieldUv + normalUv * outsideOffset,
-                  vec2(0.001),
-                  vec2(0.999)
-                )
-              ).rgb;
-              vec3 reflectedB = texture2D(
-                uPackingIrradiance,
-                clamp(
-                  fieldUv - normalUv * outsideOffset,
-                  vec2(0.001),
-                  vec2(0.999)
-                )
-              ).rgb;
-              vec3 reflected = (reflectedA + reflectedB) * 0.5;
-              float sheen = pow(clamp(
-                1.0 - abs(vPackingLocal.x * 0.9 + vPackingLocal.y * 1.2),
-                0.0,
-                1.0
-              ), 6.0);
-              vec3 silver = mix(
-                vec3(0.16, 0.2, 0.28),
-                vec3(1.05, 1.1, 1.18),
-                0.32 + sheen * 0.5 + rim * 0.18
-              );
-              return silver * 0.75
-                + reflected * 0.52
-                + directional * 0.08;
-            }
-
-            if (opticalKind > 2.5) {
-              vec2 fieldSpan = uPackingWorldBounds.zw - uPackingWorldBounds.xy;
-              vec2 normalUv = vPackingOpticalNormal / fieldSpan;
-              float outsideOffset = vPackingHalfThickness * 2.0 + 0.06;
-              vec3 refracted = texture2D(
-                uPackingIrradiance,
-                clamp(
-                  fieldUv + normalUv * (
-                    outsideOffset + vPackingLocal.x * 0.012
-                  ),
-                  vec2(0.001),
-                  vec2(0.999)
-                )
-              ).rgb;
-              return refracted * 0.66
-                + baseColour * 0.12
-                + vPackingOptical.rgb * (0.07 + rim * 0.24)
-                + directional * 0.16;
-            }
-
-            irradiance += directional;
             return baseColour * (vec3(0.1) + irradiance * 1.08)
               + irradiance * 0.06;
           }`,
-        )
-        .replace(
-          '#include <color_fragment>',
-          `#include <color_fragment>
-          float visibleOpticalKind = packingOpticalKind();
-          float visibleOpticalOpacity = packingOpticalOpacity();
-          diffuseColor.rgb *= visibleOpticalKind > 1.5
-            ? mix(vec3(1.0), vPackingOptical.rgb, 0.3)
-            : mix(
-                vPackingOptical.rgb,
-                vec3(1.0),
-                visibleOpticalOpacity * 0.68
-              );
-          diffuseColor.a *= visibleOpticalOpacity;`,
         )
         .replace(
           'vec3 outgoingLight = reflectedLight.indirectDiffuse;',
@@ -911,8 +694,8 @@ export class ReactiveVisualRenderer {
         );
     };
     material.customProgramCacheKey = () => morphPolygon
-      ? 'piano-amitabha-polygons-v4-optical-material'
-      : 'piano-amitabha-blocks-v4-optical-material';
+      ? 'piano-amitabha-polygons-v5-diffuse'
+      : 'piano-amitabha-blocks-v5-diffuse';
   }
 
   private disposeOutgoing(): void {
@@ -1028,21 +811,6 @@ export class ReactiveVisualRenderer {
     const width = Math.max(0.3, Math.min(1.38, 1.25 - pitch * 0.8 + (pseudoRandom(seed) - 0.5) * 0.26));
     const height = Math.max(0.18, Math.min(0.92, 0.22 + pitch * 0.56 + (pseudoRandom(seed + 19.4) - 0.5) * 0.2));
     const light = this.packingEmitter(seed, strength);
-    const opticalMaterial = packingOpticalMaterial(
-      this.blockSequence,
-      pseudoRandom(seed + 307.4),
-      light.emissive,
-      scheduledDirectionalPackingMaterial(
-        this.blockSequence,
-        this.impulseMode,
-        this.packingBlocks.filter(
-          (block) => block.opticalMaterial.kind === 'mirror',
-        ).length,
-        this.packingBlocks.filter(
-          (block) => block.opticalMaterial.kind === 'glass',
-        ).length,
-      ),
-    );
     const spawn = this.packingSpawn(seed, strength, height);
     const body = this.packingWorld.createDynamicBody({
       position: spawn.position,
@@ -1070,7 +838,6 @@ export class ReactiveVisualRenderer {
       emissionGreen: light.green,
       emissionBlue: light.blue,
       emissionStrength: light.strength,
-      opticalMaterial,
       transportOrder: this.blockSequence,
     };
     body.createFixture(Box(width / 2, height / 2), { density: 1, friction: 0.56, restitution: 0.1 });
@@ -1093,21 +860,6 @@ export class ReactiveVisualRenderer {
     const width = radius * 2;
     const height = radius * 2 * baseAspect;
     const light = this.packingEmitter(seed, strength);
-    const opticalMaterial = packingOpticalMaterial(
-      this.blockSequence,
-      pseudoRandom(seed + 307.4),
-      light.emissive,
-      scheduledDirectionalPackingMaterial(
-        this.blockSequence,
-        this.impulseMode,
-        this.packingBlocks.filter(
-          (block) => block.opticalMaterial.kind === 'mirror',
-        ).length,
-        this.packingBlocks.filter(
-          (block) => block.opticalMaterial.kind === 'glass',
-        ).length,
-      ),
-    );
     const spawn = this.packingSpawn(seed, strength, height);
     const body = this.packingWorld.createDynamicBody({
       position: spawn.position,
@@ -1139,7 +891,6 @@ export class ReactiveVisualRenderer {
       emissionGreen: light.green,
       emissionBlue: light.blue,
       emissionStrength: light.strength,
-      opticalMaterial,
       transportOrder: this.blockSequence,
     };
     body.createFixture(Polygon(vertices), {
@@ -1257,7 +1008,6 @@ export class ReactiveVisualRenderer {
         this.blockEmissionData[blockInstance * 4 + 1] = block.emissionGreen;
         this.blockEmissionData[blockInstance * 4 + 2] = block.emissionBlue;
         this.blockEmissionData[blockInstance * 4 + 3] = block.emissionStrength;
-        writeOpticalInstance(this.blockOpticalData, blockInstance, block.opticalMaterial);
         blockInstance += 1;
       } else {
         const meshIndex = block.sides - 3;
@@ -1278,11 +1028,6 @@ export class ReactiveVisualRenderer {
         this.polygonEmissionData[meshIndex][instanceIndex * 4 + 1] = block.emissionGreen;
         this.polygonEmissionData[meshIndex][instanceIndex * 4 + 2] = block.emissionBlue;
         this.polygonEmissionData[meshIndex][instanceIndex * 4 + 3] = block.emissionStrength;
-        writeOpticalInstance(
-          this.polygonOpticalData[meshIndex],
-          instanceIndex,
-          block.opticalMaterial,
-        );
         polygonCounts[meshIndex] += 1;
       }
     }
@@ -1290,7 +1035,6 @@ export class ReactiveVisualRenderer {
     this.blockMesh.instanceMatrix.needsUpdate = true;
     if (this.blockMesh.instanceColor) this.blockMesh.instanceColor.needsUpdate = true;
     this.blockGeometry.getAttribute('aEmission').needsUpdate = true;
-    this.blockGeometry.getAttribute('aOptical').needsUpdate = true;
     this.blockMesh.visible = blockInstance > 0;
     this.polygonMeshes.forEach((mesh, index) => {
       mesh.count = polygonCounts[index];
@@ -1299,7 +1043,6 @@ export class ReactiveVisualRenderer {
       this.polygonGeometries[index].getAttribute('aMorphSeed').needsUpdate = true;
       this.polygonGeometries[index].getAttribute('aMorphAmount').needsUpdate = true;
       this.polygonGeometries[index].getAttribute('aEmission').needsUpdate = true;
-      this.polygonGeometries[index].getAttribute('aOptical').needsUpdate = true;
       mesh.visible = polygonCounts[index] > 0;
     });
   }
@@ -1320,19 +1063,6 @@ export class ReactiveVisualRenderer {
   }
 
   private updateAmitabhaField(elapsed: number): void {
-    if (this.opticalFixtureForTest) {
-      this.amitabhaField.setBodies(
-        this.createOpticalFixture(this.opticalFixtureForTest),
-      );
-      this.amitabhaField.render();
-      this.packingIrradiance.value = this.amitabhaField.texture;
-      this.packingDirectionalIrradiance.value =
-        this.amitabhaField.directionalTexture ?? this.amitabhaField.texture;
-      this.packingDirectionalEnabled.value =
-        this.amitabhaField.stats.optical.active ? 1 : 0;
-      return;
-    }
-
     const bodies: AmitabhaBody[] = this.packingBlocks.map((block) => {
       const position = block.body.getPosition();
       this.blockColor.setHex(block.color);
@@ -1345,13 +1075,6 @@ export class ReactiveVisualRenderer {
       const morphHeight = block.kind === 'polygon'
         ? block.height * block.morphScale * block.morphAspect
         : block.height;
-      const diffuseAlbedo = block.opticalMaterial.kind === 'transparent'
-        ? 0.1
-        : block.opticalMaterial.kind === 'mirror'
-          ? 0.06
-          : block.opticalMaterial.kind === 'glass'
-            ? 0.08
-            : 0.72;
       return {
         x: position.x,
         y: position.y,
@@ -1363,11 +1086,10 @@ export class ReactiveVisualRenderer {
         albedo: block.emissive
           ? [0, 0, 0] as const
           : [
-              this.blockColor.r * diffuseAlbedo,
-              this.blockColor.g * diffuseAlbedo,
-              this.blockColor.b * diffuseAlbedo,
+              this.blockColor.r * 0.72,
+              this.blockColor.g * 0.72,
+              this.blockColor.b * 0.72,
             ] as const,
-        material: block.opticalMaterial,
         sides: block.kind === 'polygon' ? block.sides : undefined,
         transportRole: 'body',
         transportOrder: block.transportOrder,
@@ -1382,76 +1104,12 @@ export class ReactiveVisualRenderer {
       emission: [0, 0, 0],
       emissionStrength: 0,
       albedo: [0.58, 0.58, 0.62],
-      material: FLOOR_OPTICAL_MATERIAL,
       transportRole: 'floor',
       transportOrder: -1,
     });
     this.amitabhaField.setBodies(bodies);
     this.amitabhaField.render();
     this.packingIrradiance.value = this.amitabhaField.texture;
-    this.packingDirectionalIrradiance.value =
-      this.amitabhaField.directionalTexture ?? this.amitabhaField.texture;
-    this.packingDirectionalEnabled.value =
-      this.amitabhaField.stats.optical.active ? 1 : 0;
-  }
-
-  private createOpticalFixture(kind: 'mirror' | 'glass'): AmitabhaBody[] {
-    const glass = kind === 'glass';
-    const bodies: AmitabhaBody[] = [
-      {
-        x: 3,
-        y: 0,
-        halfWidth: 0.48,
-        halfHeight: 1.15,
-        angle: 0,
-        emission: [0, 0, 0],
-        emissionStrength: 0,
-        albedo: [0.56, 0.56, 0.6],
-        material: FLOOR_OPTICAL_MATERIAL,
-        transportRole: 'body',
-        transportOrder: 1,
-      },
-      {
-        x: 0,
-        y: 0,
-        halfWidth: glass ? 1.35 : 2.2,
-        halfHeight: glass ? 1.25 : 0.12,
-        angle: glass ? Math.PI / 12 : Math.PI / 4,
-        emission: [0, 0, 0],
-        emissionStrength: 0,
-        albedo: glass ? [0.06, 0.075, 0.09] : [0.04, 0.04, 0.045],
-        material: glass ? GLASS_OPTICAL_MATERIAL : MIRROR_OPTICAL_MATERIAL,
-        sides: glass ? 3 : undefined,
-        transportRole: 'body',
-        transportOrder: 2,
-      },
-    ];
-    const emitterPositions = glass
-      ? [
-          [-3.1, -0.9],
-          [-2.9, 1.65],
-          [0.2, -3.1],
-        ] as const
-      : [
-          [0, -3],
-          [0, 3],
-        ] as const;
-    emitterPositions.forEach(([x, y], index) => {
-      bodies.push({
-        x,
-        y,
-        halfWidth: glass ? 0.72 : 0.82,
-        halfHeight: glass ? 0.72 : 0.42,
-        angle: 0,
-        emission: [1, 0.72, 0.34],
-        emissionStrength: 4.2,
-        albedo: [0, 0, 0],
-        material: FLOOR_OPTICAL_MATERIAL,
-        transportRole: 'body',
-        transportOrder: 3 + index,
-      });
-    });
-    return bodies;
   }
 
   private updatePackingFloor(dt: number): void {
@@ -1581,13 +1239,8 @@ export class ReactiveVisualRenderer {
     this.hrcStableElapsed = 0;
     this.hrcQuality = this.quality;
     this.resetFrameTimingWindow();
-    this.opticalQualityController.reset();
-    this.resetOpticalBaseline();
-    this.amitabhaField.setOpticalPreset(opticalQualityPreset(5));
     this.amitabhaField.reset();
     this.packingIrradiance.value = this.amitabhaField.texture;
-    this.packingDirectionalIrradiance.value = this.amitabhaField.texture;
-    this.packingDirectionalEnabled.value = 0;
     this.resetPackingCamera();
     this.modeFiveCameraPhase = 'idle';
     this.modeFiveCameraElapsed = 0;
@@ -1874,71 +1527,9 @@ export class ReactiveVisualRenderer {
     if (document.visibilityState !== 'visible') {
       this.hrcSlowElapsed = 0;
       this.hrcStableElapsed = 0;
-      this.opticalQualityController.reset();
-      this.resetOpticalBaseline();
       this.resetFrameTimingWindow();
-      this.amitabhaField.setOpticalPreset(opticalQualityPreset(5));
       return;
     }
-
-    const opticalActive = this.opticalFixtureForTest !== null
-      || this.packingBlocks.some(
-        (block) => block.opticalMaterial.kind === 'mirror'
-          || block.opticalMaterial.kind === 'glass',
-      );
-    if (!opticalActive && this.hrcFrameTimeP95Ms > 0) {
-      this.opticalBaselineElapsed += dt;
-      this.opticalBaselineAccumulator += this.hrcFrameTimeP95Ms;
-      this.opticalBaselineSamples += 1;
-      if (
-        this.opticalBaselineP95Ms === null
-        && this.opticalBaselineElapsed >= 5
-      ) {
-        this.opticalBaselineP95Ms = this.opticalBaselineAccumulator
-          / Math.max(1, this.opticalBaselineSamples);
-      }
-    }
-    if (
-      opticalActive
-      && this.opticalBaselineP95Ms === null
-      && this.opticalBaselineSamples > 0
-    ) {
-      // A fast performance or test gesture can spawn the first mirror before
-      // the preferred five-second calibration window. Freeze the clean
-      // partial sample instead of losing relative +5%/+1 ms protection for
-      // the rest of the scene.
-      this.opticalBaselineP95Ms = this.opticalBaselineAccumulator
-        / this.opticalBaselineSamples;
-    }
-
-    if (this.opticalFixtureForTest) {
-      if (!this.opticalQualityController.stats.operational) {
-        this.opticalQualityController.update({
-          frameTimeP95Ms: this.hrcFrameTimeP95Ms,
-          dtSeconds: 0,
-          baselineP95Ms: null,
-          quality: this.quality,
-          opticalActive: true,
-          opticalAvailable: this.amitabhaField.opticalSupported,
-        });
-      }
-      this.amitabhaField.setOpticalPreset(
-        opticalQualityPreset(this.quality === 'safe' ? 2 : 0),
-      );
-      this.hrcSlowElapsed = 0;
-      this.hrcStableElapsed = 0;
-      return;
-    }
-
-    const opticalDecision = this.opticalQualityController.update({
-      frameTimeP95Ms: this.hrcFrameTimeP95Ms,
-      dtSeconds: dt,
-      baselineP95Ms: this.opticalBaselineP95Ms,
-      quality: this.quality,
-      opticalActive,
-      opticalAvailable: this.amitabhaField.opticalSupported,
-    });
-    this.amitabhaField.setOpticalPreset(opticalDecision.preset);
 
     if (this.quality === 'safe') {
       if (this.hrcQuality !== 'safe') {
@@ -1949,21 +1540,6 @@ export class ReactiveVisualRenderer {
     }
 
     const p95 = this.hrcFrameTimeP95Ms;
-    const opticalProtectsHrc = opticalActive && opticalDecision.tier < 5;
-    if (opticalProtectsHrc) {
-      this.hrcSlowElapsed = 0;
-      if (p95 > 0 && p95 < 15 && this.hrcQuality !== 'high') {
-        this.hrcStableElapsed += dt;
-        if (this.hrcStableElapsed >= 5) {
-          this.hrcQuality = 'high';
-          this.amitabhaField.setQuality('high');
-        }
-      } else {
-        this.hrcStableElapsed = 0;
-      }
-      return;
-    }
-
     if (p95 > 20) {
       this.hrcSlowElapsed += dt;
       this.hrcStableElapsed = 0;
@@ -1984,13 +1560,6 @@ export class ReactiveVisualRenderer {
     } else {
       this.hrcStableElapsed = 0;
     }
-  }
-
-  private resetOpticalBaseline(): void {
-    this.opticalBaselineP95Ms = null;
-    this.opticalBaselineElapsed = 0;
-    this.opticalBaselineAccumulator = 0;
-    this.opticalBaselineSamples = 0;
   }
 
   private resetFrameTimingWindow(): void {

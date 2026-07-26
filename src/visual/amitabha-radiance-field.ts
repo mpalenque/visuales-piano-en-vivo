@@ -1,15 +1,4 @@
 import * as THREE from 'three';
-import {
-  DirectionalMaterialField,
-  type DirectionalEnergyProbe,
-  type DirectionalMaterialFieldStats,
-} from './directional-material-field';
-import {
-  isDirectionalOpticalMaterial,
-  opticalMaterialCode,
-  type OpticalMaterial,
-} from './optical-materials';
-import type { OpticalQualityPreset } from './optical-quality-controller';
 
 // WebGL2 port of Yaazarai/Volumetric-HRC's ray-extension implementation:
 // https://github.com/Yaazarai/Volumetric-HRC (Unlicense).
@@ -35,7 +24,6 @@ export interface AmitabhaBody {
   emission: readonly [number, number, number];
   emissionStrength: number;
   albedo: readonly [number, number, number];
-  material: OpticalMaterial;
   sides?: number;
   transportRole?: 'body' | 'floor';
   transportOrder?: number;
@@ -66,15 +54,6 @@ export function selectTransportBodies(
     (right.transportOrder ?? 0) - (left.transportOrder ?? 0);
 
   addUntilFull(bodies.filter((body) => body.transportRole === 'floor'));
-  addUntilFull(
-    bodies
-      .filter((body) => (
-        body.transportRole !== 'floor'
-        && body.emissionStrength <= 0
-        && isDirectionalOpticalMaterial(body.material)
-      ))
-      .sort(recentFirst),
-  );
   const emitterBudget = Math.min(
     20,
     Math.max(1, Math.floor((selectedLimit - selected.size) * 0.55)),
@@ -90,7 +69,6 @@ export function selectTransportBodies(
       .filter((body) => (
         body.transportRole !== 'floor'
         && body.emissionStrength <= 0
-        && !isDirectionalOpticalMaterial(body.material)
       ))
       .sort(recentFirst),
   );
@@ -112,7 +90,6 @@ export interface AmitabhaRadianceStats {
   updateHz: number;
   targetMemoryBytes: number;
   drawCalls: number;
-  optical: DirectionalMaterialFieldStats;
 }
 
 const passVertexShader = /* glsl */ `
@@ -193,8 +170,7 @@ const sceneFragmentShader = /* glsl */ `
       )) continue;
 
       vec4 source = uBodyEmission[bodyIndex];
-      float materialKind = floor(uBodyMeta[bodyIndex].y + 0.5);
-      float sourceStrength = materialKind < 0.5 ? source.a : 0.0;
+      float sourceStrength = source.a;
       vec3 diffuseBounce = previousLight
         * uBodyAlbedo[bodyIndex].rgb
         * uBounceGain;
@@ -615,8 +591,6 @@ const displayFragmentShader = /* glsl */ `
   in vec2 vUv;
   out vec4 outColour;
   uniform sampler2D uIrradiance;
-  uniform sampler2D uDirectionalIrradiance;
-  uniform float uDirectionalEnabled;
   uniform float uDisplayRoll;
   uniform vec4 uWorldBounds;
 
@@ -648,8 +622,7 @@ const displayFragmentShader = /* glsl */ `
       || any(greaterThan(fieldUv, vec2(1.0)));
     vec3 radiance = outsideField
       ? vec3(0.0)
-      : texture(uIrradiance, fieldUv).rgb
-        + texture(uDirectionalIrradiance, fieldUv).rgb * uDirectionalEnabled;
+      : texture(uIrradiance, fieldUv).rgb;
     vec3 exposed = radiance * 1.7;
     vec3 mapped = acesToneMap(exposed);
     outColour = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
@@ -718,7 +691,6 @@ export class AmitabhaRadianceField {
   private readonly mergeMaterial: THREE.ShaderMaterial;
   private readonly copyMaterial: THREE.ShaderMaterial;
   private readonly fluenceMaterial: THREE.ShaderMaterial;
-  private readonly directionalField: DirectionalMaterialField;
   private readonly passMesh: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private fieldReadIndex = 0;
   private nextFrustum = 0;
@@ -730,16 +702,10 @@ export class AmitabhaRadianceField {
   private updateHz = 0;
   private targetMemoryBytes = 0;
   private drawCalls = 0;
-  private mirrorCount = 0;
-  private glassCount = 0;
   readonly displayMaterial: THREE.ShaderMaterial;
 
   constructor(private readonly renderer: THREE.WebGLRenderer) {
     this.allocateTargets(HIGH_FIELD_EXTENT);
-    this.directionalField = new DirectionalMaterialField(
-      renderer,
-      AMITABHA_WORLD_BOUNDS,
-    );
     this.sceneMaterial = makeMaterial(sceneFragmentShader, {
       uBodyCount: this.bodyCount,
       uBodyShape: { value: this.bodyShape },
@@ -793,8 +759,6 @@ export class AmitabhaRadianceField {
     this.displayMaterial = new THREE.ShaderMaterial({
       uniforms: {
         uIrradiance: { value: this.fieldTargets[0].texture },
-        uDirectionalIrradiance: { value: this.fieldTargets[0].texture },
-        uDirectionalEnabled: { value: 0 },
         uDisplayRoll: { value: 0 },
         uWorldBounds: { value: AMITABHA_WORLD_BOUNDS.clone() },
       },
@@ -808,23 +772,10 @@ export class AmitabhaRadianceField {
     this.passMesh = new THREE.Mesh(this.quadGeometry, this.sceneMaterial);
     this.passMesh.frustumCulled = false;
     this.passScene.add(this.passMesh);
-    this.directionalField.precompile();
   }
 
   get texture(): THREE.Texture {
     return this.fieldTargets[this.fieldReadIndex].texture;
-  }
-
-  get directionalTexture(): THREE.Texture | null {
-    return this.directionalField.texture;
-  }
-
-  get opticalSupported(): boolean {
-    return this.directionalField.isSupported;
-  }
-
-  get opticalRequested(): boolean {
-    return this.directionalField.isRequested;
   }
 
   get stats(): AmitabhaRadianceStats {
@@ -834,21 +785,11 @@ export class AmitabhaRadianceField {
       updateHz: this.updateHz,
       targetMemoryBytes: this.targetMemoryBytes,
       drawCalls: this.drawCalls,
-      optical: this.directionalField.stats,
     };
   }
 
   setDisplayRoll(radians: number): void {
     this.displayMaterial.uniforms.uDisplayRoll.value = radians;
-  }
-
-  setOpticalPreset(preset: OpticalQualityPreset): void {
-    this.directionalField.setPreset(preset);
-    this.updateDirectionalDisplayUniforms();
-  }
-
-  readDirectionalEnergyProbe(): DirectionalEnergyProbe {
-    return this.directionalField.readEnergyProbe();
   }
 
   setQuality(quality: 'high' | 'safe'): void {
@@ -865,7 +806,6 @@ export class AmitabhaRadianceField {
     this.completedCycles = 0;
     this.updateWindowStartedAt = 0;
     this.updateHz = 0;
-    this.directionalField.reset();
     this.updateTargetUniforms();
     this.clearTargets();
   }
@@ -888,41 +828,27 @@ export class AmitabhaRadianceField {
   setBodies(bodies: readonly AmitabhaBody[]): void {
     const selected = selectTransportBodies(bodies);
     this.bodyCount.value = selected.length;
-    this.mirrorCount = 0;
-    this.glassCount = 0;
     selected.forEach((body, index) => {
-      const materialCode = opticalMaterialCode(body.material);
-      const opticalWeight = body.material.kind === 'mirror'
-        ? body.material.reflectivity
-        : body.material.transmission;
-      const sourceColour = body.material.kind === 'diffuse'
-        ? body.emission
-        : body.material.tint;
-      const sourceStrength = body.material.kind === 'diffuse'
-        ? body.emissionStrength
-        : opticalWeight;
       this.bodyShape[index].set(body.x, body.y, body.halfWidth, body.halfHeight);
       this.bodyFrame[index].set(Math.cos(body.angle), Math.sin(body.angle), 0, 0);
       this.bodyEmission[index].set(
-        sourceColour[0],
-        sourceColour[1],
-        sourceColour[2],
-        sourceStrength,
+        body.emission[0],
+        body.emission[1],
+        body.emission[2],
+        body.emissionStrength,
       );
       this.bodyAlbedo[index].set(
         body.albedo[0],
         body.albedo[1],
         body.albedo[2],
-        body.material.absorption,
+        9,
       );
       this.bodyMeta[index].set(
         body.sides ?? 0,
-        materialCode,
-        body.material.roughness,
-        body.material.ior,
+        0,
+        1,
+        1,
       );
-      if (body.material.kind === 'mirror') this.mirrorCount += 1;
-      if (body.material.kind === 'glass') this.glassCount += 1;
     });
   }
 
@@ -936,18 +862,6 @@ export class AmitabhaRadianceField {
 
     if (!this.cycleActive) {
       this.renderSceneInputs();
-      this.directionalField.capture(
-        {
-          count: this.bodyCount.value,
-          shape: this.bodyShape,
-          frame: this.bodyFrame,
-          emission: this.bodyEmission,
-          albedo: this.bodyAlbedo,
-          meta: this.bodyMeta,
-        },
-        this.mirrorCount,
-        this.glassCount,
-      );
       this.nextFrustum = 0;
       this.cycleActive = true;
     }
@@ -966,9 +880,7 @@ export class AmitabhaRadianceField {
       const writeIndex = 1 - this.fieldReadIndex;
       this.renderPass(this.fluenceMaterial, this.fieldTargets[writeIndex]);
       this.fieldReadIndex = writeIndex;
-      this.directionalField.renderCaptured();
       this.displayMaterial.uniforms.uIrradiance.value = this.texture;
-      this.updateDirectionalDisplayUniforms();
       this.cycleActive = false;
       this.recordCompletedCycle();
     }
@@ -979,11 +891,8 @@ export class AmitabhaRadianceField {
 
   reset(): void {
     this.bodyCount.value = 0;
-    this.mirrorCount = 0;
-    this.glassCount = 0;
     this.cycleActive = false;
     this.nextFrustum = 0;
-    this.directionalField.reset();
     this.clearTargets();
   }
 
@@ -995,7 +904,6 @@ export class AmitabhaRadianceField {
     this.mergeMaterial.dispose();
     this.copyMaterial.dispose();
     this.fluenceMaterial.dispose();
-    this.directionalField.dispose();
     this.displayMaterial.dispose();
     this.disposeTargets();
   }
@@ -1072,7 +980,6 @@ export class AmitabhaRadianceField {
     this.renderer.setClearColor(previousColour, previousAlpha);
     this.fieldReadIndex = 0;
     this.displayMaterial.uniforms.uIrradiance.value = this.texture;
-    this.updateDirectionalDisplayUniforms();
     this.initialized = true;
   }
 
@@ -1140,15 +1047,6 @@ export class AmitabhaRadianceField {
     this.fluenceMaterial.uniforms.uFrustum2.value = this.frustumTargets[2].texture;
     this.fluenceMaterial.uniforms.uFrustum3.value = this.frustumTargets[3].texture;
     this.displayMaterial.uniforms.uIrradiance.value = this.fieldTargets[0].texture;
-    this.updateDirectionalDisplayUniforms();
-  }
-
-  private updateDirectionalDisplayUniforms(): void {
-    const directionalTexture = this.directionalField.texture;
-    this.displayMaterial.uniforms.uDirectionalIrradiance.value =
-      directionalTexture ?? this.texture;
-    this.displayMaterial.uniforms.uDirectionalEnabled.value =
-      directionalTexture && this.directionalField.stats.active ? 1 : 0;
   }
 
   private recordCompletedCycle(): void {

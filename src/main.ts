@@ -41,31 +41,12 @@ if (panelOnly) {
     state: 'lost', quality: 'high', pixelRatio: 0, width: 0, height: 0,
     drawCalls: 0, geometries: 0, textures: 0, contextLosses: 0,
     fpsAverage: 0, frameTimeP95Ms: 0, tabVisible: document.visibilityState === 'visible',
-    voronoiCells: 5, packingGravityEnabled: true, packingTransparentCount: 0,
-    packingMirrorCount: 0, packingGlassCount: 0,
+    voronoiCells: 5, packingGravityEnabled: true,
     hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 2, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
-    opticalSupported: false, opticalAllocated: false, opticalActive: false,
-    opticalTier: 5, opticalResolution: 0, opticalDirectionsPerPixel: 0,
-    opticalMaxStepsPerSegment: 0, opticalUpdateEveryHrcCycles: 0,
-    opticalMaterials: 'off', opticalUpdateHz: 0, opticalTargetMemoryBytes: 0,
-    opticalTargetTextureCount: 0, opticalDrawCalls: 0, opticalFallbackRatio: 0,
   };
   try {
     renderer = new ReactiveVisualRenderer(canvas);
     rendererStatus = renderer.getStatus();
-    if (new URLSearchParams(window.location.search).has('opticalTest')) {
-      (
-        window as Window & {
-          __PIANO_OPTICAL_TEST__?: {
-            readEnergy: () => ReturnType<RendererInstance['readOpticalEnergyProbeForTest']>;
-            setFixture: (kind: 'mirror' | 'glass' | null) => void;
-          };
-        }
-      ).__PIANO_OPTICAL_TEST__ = {
-        readEnergy: () => renderer!.readOpticalEnergyProbeForTest(),
-        setFixture: (kind) => renderer!.setOpticalFixtureForTest(kind),
-      };
-    }
   } catch (error) {
     notice = error instanceof Error ? `No se pudo iniciar WebGL: ${error.message}` : 'No se pudo iniciar WebGL.';
   }
@@ -163,11 +144,11 @@ if (panelOnly) {
           : action.mode === 2
             ? 'Impulso 02 activo: las partículas nacen abajo y se acumulan hacia arriba.'
             : action.mode === 3
-              ? 'Impulso 03 activo: HRC con transparencia y espejos direccionales de un rebote.'
+              ? 'Impulso 03 activo: cajas físicas iluminadas por HRC difuso.'
               : action.mode === 4
                 ? 'Impulso 04 activo: agudas suman celdas Voronoi; graves las restan.'
                 : action.mode === 5
-                  ? 'Impulso 05 activo: polígonos HRC con espejo, vidrio refractivo y caústicas 2D.'
+                  ? 'Impulso 05 activo: polígonos morfológicos iluminados por HRC.'
                   : `Impulso ${String(action.mode).padStart(2, '0')} todavía no está implementado.`;
         revision += 1;
       }
@@ -335,7 +316,6 @@ if (panelOnly) {
         || rendererStatus.textures
           > rendererResourceBaseline.textures
             + 1
-            + rendererStatus.opticalTargetTextureCount
       ) {
         if (notice === null) {
           notice = 'Los recursos WebGL crecieron tras cambios de escena; usá Modo seguro y recargá entre piezas.';
