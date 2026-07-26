@@ -52,6 +52,24 @@ const opticalMaterialColour = (
     ? 0x42ddff
     : 0x77727d;
 
+const packingPolygonGeometry = (sides: number): THREE.BufferGeometry => {
+  const geometry = new THREE.CircleGeometry(1, sides).toNonIndexed();
+  const vertexCount = geometry.getAttribute('position').count;
+  const boundaryDistance = new Float32Array(vertexCount);
+  for (let triangle = 0; triangle < vertexCount; triangle += 3) {
+    // CircleGeometry triangles are [outer, outer, centre]. Interpolating this
+    // value resolves only the silhouette, without seams in the triangle fan.
+    boundaryDistance[triangle] = 0;
+    boundaryDistance[triangle + 1] = 0;
+    boundaryDistance[triangle + 2] = 1;
+  }
+  geometry.setAttribute(
+    'aPackingBoundary',
+    new THREE.BufferAttribute(boundaryDistance, 1),
+  );
+  return geometry;
+};
+
 interface NoteParticle {
   age: number;
   note: DetectedNote;
@@ -246,7 +264,10 @@ export class ReactiveVisualRenderer {
   private readonly polygonMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.97, depthWrite: false });
   private readonly polygonMorphTime = { value: 0 };
   private readonly blockMesh = new THREE.InstancedMesh(this.blockGeometry, this.blockMaterial, MAX_PACKING_BLOCKS);
-  private readonly polygonGeometries = Array.from({ length: 6 }, (_, index) => new THREE.CircleGeometry(1, index + 3));
+  private readonly polygonGeometries = Array.from(
+    { length: 6 },
+    (_, index) => packingPolygonGeometry(index + 3),
+  );
   private readonly polygonMorphSeeds = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS));
   private readonly polygonMorphAmounts = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS));
   private readonly blockEmissionData = new Float32Array(MAX_PACKING_BLOCKS * 4);
@@ -678,9 +699,11 @@ export class ReactiveVisualRenderer {
           varying vec2 vPackingLocal;
           varying vec4 vPackingEmission;
           varying float vPackingOpticalKind;
+          varying float vPackingBoundary;
           ${morphPolygon
             ? `attribute float aMorphSeed;
           attribute float aMorphAmount;
+          attribute float aPackingBoundary;
           uniform float uMorphTime;`
             : ''}`,
         )
@@ -709,6 +732,7 @@ export class ReactiveVisualRenderer {
           `vPackingEmission = aEmission;
           vPackingOpticalKind = aOpticalKind;
           vPackingLocal = transformed.xy;
+          vPackingBoundary = ${morphPolygon ? 'aPackingBoundary' : '1.0'};
           #ifdef USE_INSTANCING
             vec4 packingPosition = instanceMatrix * vec4(transformed, 1.0);
           #else
@@ -726,13 +750,23 @@ export class ReactiveVisualRenderer {
           varying vec2 vPackingLocal;
           varying vec4 vPackingEmission;
           varying float vPackingOpticalKind;
+          varying float vPackingBoundary;
           uniform sampler2D uPackingIrradiance;
           uniform vec4 uPackingWorldBounds;
 
           float packingOpticalEdge() {
             ${morphPolygon
-              ? 'return clamp(length(vPackingLocal), 0.0, 1.0);'
+              ? 'return 1.0 - clamp(vPackingBoundary, 0.0, 1.0);'
               : 'return clamp(max(abs(vPackingLocal.x), abs(vPackingLocal.y)) * 2.0, 0.0, 1.0);'}
+          }
+
+          float packingShapeCoverage() {
+            ${morphPolygon
+              ? `float width = max(fwidth(vPackingBoundary) * 1.35, 0.0005);
+            return smoothstep(0.0, width, vPackingBoundary);`
+              : `float interior = 0.5 - max(abs(vPackingLocal.x), abs(vPackingLocal.y));
+            float width = max(fwidth(interior) * 1.35, 0.0005);
+            return smoothstep(0.0, width, interior);`}
           }
 
           vec3 applyAmitabhaLighting(vec3 baseColour) {
@@ -786,7 +820,8 @@ export class ReactiveVisualRenderer {
             diffuseColor.a *= mix(0.16, 0.86, glassFresnel);
           } else if (vPackingOpticalKind > 0.5) {
             diffuseColor.a *= 0.98;
-          }`,
+          }
+          diffuseColor.a *= packingShapeCoverage();`,
         )
         .replace(
           'vec3 outgoingLight = reflectedLight.indirectDiffuse;',
@@ -1742,7 +1777,9 @@ export class ReactiveVisualRenderer {
   };
 
   private applyQuality(): void {
-    this.renderer.setPixelRatio(this.quality === 'safe' ? 0.65 : 1);
+    // High mode supersamples modestly even on a 1× display. MSAA handles
+    // triangle coverage while the shader resolves translucent silhouettes.
+    this.renderer.setPixelRatio(this.quality === 'safe' ? 0.65 : 1.2);
   }
 
   private updateTransportQuality(dt: number): void {

@@ -593,6 +593,7 @@ const displayFragmentShader = /* glsl */ `
   uniform sampler2D uIrradiance;
   uniform float uDisplayRoll;
   uniform vec4 uWorldBounds;
+  uniform vec2 uFieldTexel;
 
   vec3 acesToneMap(vec3 colour) {
     const float a = 2.51;
@@ -620,9 +621,24 @@ const displayFragmentShader = /* glsl */ `
       / (uWorldBounds.zw - uWorldBounds.xy);
     bool outsideField = any(lessThan(fieldUv, vec2(0.0)))
       || any(greaterThan(fieldUv, vec2(1.0)));
-    vec3 radiance = outsideField
-      ? vec3(0.0)
-      : texture(uIrradiance, fieldUv).rgb;
+    vec2 sampleUv = clamp(fieldUv, uFieldTexel, vec2(1.0) - uFieldTexel);
+    vec2 resolveOffset = uFieldTexel * 0.48;
+    vec3 radiance = vec3(0.0);
+    if (!outsideField) {
+      // Resolve the HRC grid inside the existing display pass. Four bilinear
+      // taps smooth diagonal occlusion without another render target.
+      radiance += texture(uIrradiance, sampleUv + resolveOffset).rgb;
+      radiance += texture(
+        uIrradiance,
+        sampleUv + vec2(-resolveOffset.x, resolveOffset.y)
+      ).rgb;
+      radiance += texture(
+        uIrradiance,
+        sampleUv + vec2(resolveOffset.x, -resolveOffset.y)
+      ).rgb;
+      radiance += texture(uIrradiance, sampleUv - resolveOffset).rgb;
+      radiance *= 0.25;
+    }
     vec3 exposed = radiance * 1.7;
     vec3 mapped = acesToneMap(exposed);
     outColour = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
@@ -761,6 +777,9 @@ export class AmitabhaRadianceField {
         uIrradiance: { value: this.fieldTargets[0].texture },
         uDisplayRoll: { value: 0 },
         uWorldBounds: { value: AMITABHA_WORLD_BOUNDS.clone() },
+        uFieldTexel: {
+          value: new THREE.Vector2(1 / this.fieldExtent, 1 / this.fieldExtent),
+        },
       },
       vertexShader: displayVertexShader,
       fragmentShader: displayFragmentShader,
@@ -1047,6 +1066,10 @@ export class AmitabhaRadianceField {
     this.fluenceMaterial.uniforms.uFrustum2.value = this.frustumTargets[2].texture;
     this.fluenceMaterial.uniforms.uFrustum3.value = this.frustumTargets[3].texture;
     this.displayMaterial.uniforms.uIrradiance.value = this.fieldTargets[0].texture;
+    this.displayMaterial.uniforms.uFieldTexel.value.set(
+      1 / this.fieldExtent,
+      1 / this.fieldExtent,
+    );
   }
 
   private recordCompletedCycle(): void {

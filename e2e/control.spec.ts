@@ -150,6 +150,7 @@ test('la óptica forward se reporta sin reemplazar el HRC', async ({ browser }) 
   }
 
   const rendererDetail = visual.locator('[data-status="webgl-detail"]');
+  await expect(rendererDetail).toContainText('DPR 1.2');
   await expect(rendererDetail).toContainText(/HRC (512|256)²/);
   await expect(rendererDetail).toContainText(/óptica (high|safe|off)/);
   expect(consoleErrors).toEqual([]);
