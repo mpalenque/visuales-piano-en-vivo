@@ -9,11 +9,15 @@ const MAX_BODIES = 48;
 const HIGH_FIELD_EXTENT = 512;
 const SAFE_FIELD_EXTENT = 256;
 const FRUSTUM_COUNT = 4;
-const DEFAULT_FRUSTUMS_PER_STEP = 2;
+const DEFAULT_FRUSTUMS_PER_STEP = FRUSTUM_COUNT;
 
 // The smallest square domain that covers the visible 16:9 camera throughout
 // a 90° roll. It keeps the radiance map continuous at every turn angle.
 export const AMITABHA_WORLD_BOUNDS = new THREE.Vector4(-8.8, -8.8, 8.8, 8.8);
+// The display pass does not write depth and renders before the foreground
+// bodies, so it can share their Z plane. Putting it behind them introduces
+// perspective parallax and makes the field look offset from its emitter.
+export const AMITABHA_DISPLAY_Z = 0;
 
 export interface AmitabhaBody {
   x: number;
@@ -25,6 +29,10 @@ export interface AmitabhaBody {
   emissionStrength: number;
   albedo: readonly [number, number, number];
   sides?: number;
+  /** Inner radius as a 0–1 fraction of the outer ellipse; 0 keeps a solid body. */
+  innerRadius?: number;
+  /** Optical absorption coefficient. Defaults to the original opaque value. */
+  absorption?: number;
   transportRole?: 'body' | 'floor';
   transportOrder?: number;
 }
@@ -125,12 +133,20 @@ const sceneFragmentShader = /* glsl */ `
   uniform vec4 uBodyAlbedo[${MAX_BODIES}];
   uniform vec4 uBodyMeta[${MAX_BODIES}];
   uniform sampler2D uPreviousIrradiance;
+  uniform sampler2D uExternalScene;
+  uniform bool uExternalSceneEnabled;
   uniform float uBounceGain;
 
   const float PI = 3.141592653589793;
   const float TWO_PI = 6.283185307179586;
 
-  bool insideBody(vec2 worldPosition, vec4 shape, vec4 frame, float sides) {
+  bool insideBody(
+    vec2 worldPosition,
+    vec4 shape,
+    vec4 frame,
+    float sides,
+    float innerRadius
+  ) {
     vec2 offset = worldPosition - shape.xy;
     vec2 local = vec2(
       frame.x * offset.x + frame.y * offset.y,
@@ -138,9 +154,19 @@ const sceneFragmentShader = /* glsl */ `
     );
     vec2 normalizedPosition = local / max(shape.zw, vec2(0.0001));
 
+    if (innerRadius > 0.0001) {
+      float radius = length(normalizedPosition);
+      return radius <= 1.0 && radius >= clamp(innerRadius, 0.0, 0.98);
+    }
+
     if (sides < 2.5) {
       return all(lessThanEqual(abs(normalizedPosition), vec2(1.0)));
     }
+
+    // A high side-count is the renderer's circle sentinel. Keeping it as an
+    // analytic disc avoids turning the falling circles into visible octagons
+    // in the radiance field while preserving the bounded material ABI.
+    if (sides > 15.5) return length(normalizedPosition) <= 1.0;
 
     float count = clamp(floor(sides + 0.5), 3.0, 8.0);
     float angle = atan(normalizedPosition.y, normalizedPosition.x);
@@ -151,10 +177,21 @@ const sceneFragmentShader = /* glsl */ `
   }
 
   void main() {
-    vec3 emissivity = vec3(0.0);
-    vec3 absorption = vec3(0.0);
-    float directEmissionStrength = 0.0;
+    vec4 externalScene = uExternalSceneEnabled
+      ? texture(uExternalScene, vUv)
+      : vec4(0.0);
+    vec3 emissivity = externalScene.rgb * 3.1;
+    vec3 absorption = vec3(clamp(externalScene.a * 3.0, 0.0, 8.0));
+    float directEmissionStrength = uExternalSceneEnabled
+      ? max(max(externalScene.r, externalScene.g), externalScene.b)
+      : 0.0;
     vec3 previousLight = texture(uPreviousIrradiance, vUv).rgb;
+    if (uExternalSceneEnabled) {
+      emissivity += previousLight
+        * mix(vec3(0.045, 0.1, 0.13), externalScene.rgb, 0.28)
+        * min(externalScene.a, 1.0)
+        * uBounceGain;
+    }
 
     for (int bodyIndex = 0; bodyIndex < ${MAX_BODIES}; bodyIndex++) {
       if (bodyIndex >= uBodyCount) break;
@@ -166,7 +203,8 @@ const sceneFragmentShader = /* glsl */ `
         ),
         uBodyShape[bodyIndex],
         uBodyFrame[bodyIndex],
-        uBodyMeta[bodyIndex].x
+        uBodyMeta[bodyIndex].x,
+        uBodyMeta[bodyIndex].y
       )) continue;
 
       vec4 source = uBodyEmission[bodyIndex];
@@ -591,9 +629,13 @@ const displayFragmentShader = /* glsl */ `
   in vec2 vUv;
   out vec4 outColour;
   uniform sampler2D uIrradiance;
+  uniform sampler2D uBackgroundTexture;
+  uniform float uBackgroundEnabled;
+  uniform float uBackgroundOpacity;
   uniform float uDisplayRoll;
   uniform vec4 uWorldBounds;
   uniform vec2 uFieldTexel;
+  uniform float uResolveSharpness;
 
   vec3 acesToneMap(vec3 colour) {
     const float a = 2.51;
@@ -622,24 +664,60 @@ const displayFragmentShader = /* glsl */ `
     bool outsideField = any(lessThan(fieldUv, vec2(0.0)))
       || any(greaterThan(fieldUv, vec2(1.0)));
     vec2 sampleUv = clamp(fieldUv, uFieldTexel, vec2(1.0) - uFieldTexel);
-    vec2 resolveOffset = uFieldTexel * 0.48;
     vec3 radiance = vec3(0.0);
     if (!outsideField) {
-      // Resolve the HRC grid inside the existing display pass. Four bilinear
-      // taps smooth diagonal occlusion without another render target.
-      radiance += texture(uIrradiance, sampleUv + resolveOffset).rgb;
-      radiance += texture(
-        uIrradiance,
-        sampleUv + vec2(-resolveOffset.x, resolveOffset.y)
-      ).rgb;
-      radiance += texture(
-        uIrradiance,
-        sampleUv + vec2(resolveOffset.x, -resolveOffset.y)
-      ).rgb;
-      radiance += texture(uIrradiance, sampleUv - resolveOffset).rgb;
-      radiance *= 0.25;
+      // Edge-adaptive 3x3 reconstruction. It smooths along radiance edges,
+      // not across them, then restores local contrast lost by 512² transport.
+      vec2 dx = vec2(uFieldTexel.x, 0.0);
+      vec2 dy = vec2(0.0, uFieldTexel.y);
+      vec3 center = texture(uIrradiance, sampleUv).rgb;
+      vec3 west = texture(uIrradiance, sampleUv - dx).rgb;
+      vec3 east = texture(uIrradiance, sampleUv + dx).rgb;
+      vec3 north = texture(uIrradiance, sampleUv + dy).rgb;
+      vec3 south = texture(uIrradiance, sampleUv - dy).rgb;
+      vec3 northWest = texture(uIrradiance, sampleUv - dx + dy).rgb;
+      vec3 northEast = texture(uIrradiance, sampleUv + dx + dy).rgb;
+      vec3 southWest = texture(uIrradiance, sampleUv - dx - dy).rgb;
+      vec3 southEast = texture(uIrradiance, sampleUv + dx - dy).rgb;
+
+      float horizontalEdge = length(east - west)
+        + 0.5 * length(northEast - northWest)
+        + 0.5 * length(southEast - southWest);
+      float verticalEdge = length(north - south)
+        + 0.5 * length(northEast - southEast)
+        + 0.5 * length(northWest - southWest);
+      vec3 horizontalResolve = (west + center * 2.0 + east) * 0.25;
+      vec3 verticalResolve = (south + center * 2.0 + north) * 0.25;
+      vec3 directional = horizontalEdge < verticalEdge
+        ? horizontalResolve
+        : verticalResolve;
+      vec3 cardinal = (west + east + north + south) * 0.25;
+      vec3 diagonal = (
+        northWest + northEast + southWest + southEast
+      ) * 0.25;
+      vec3 localBlur = center * 0.38 + cardinal * 0.42 + diagonal * 0.2;
+      vec3 reconstructed = mix(center, directional, 0.18);
+      radiance = max(
+        reconstructed + (reconstructed - localBlur) * uResolveSharpness,
+        vec3(0.0)
+      );
+      vec3 localMaximum = max(
+        max(max(center, cardinal), diagonal),
+        vec3(0.0001)
+      );
+      radiance = min(radiance, localMaximum * 1.16);
     }
-    vec3 exposed = radiance * 1.7;
+    vec3 background = uBackgroundEnabled > 0.5
+      ? texture(uBackgroundTexture, vUv).rgb
+      : vec3(0.0);
+    // Keep the cloud image atmospheric so the Radiance Cascade still owns the
+    // contrast, emitters and shadows instead of being washed out by the photo.
+    background = mix(
+      vec3(0.002, 0.006, 0.016),
+      background * vec3(0.34, 0.54, 0.84),
+      uBackgroundOpacity
+    );
+    vec3 exposed = background + radiance * 1.7;
     vec3 mapped = acesToneMap(exposed);
     outColour = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
   }
@@ -730,6 +808,8 @@ export class AmitabhaRadianceField {
       uBodyAlbedo: { value: this.bodyAlbedo },
       uBodyMeta: { value: this.bodyMeta },
       uPreviousIrradiance: { value: this.fieldTargets[0].texture },
+      uExternalScene: { value: this.fieldTargets[0].texture },
+      uExternalSceneEnabled: { value: false },
       uBounceGain: { value: 0.24 },
     });
     this.seedMaterial = makeMaterial(frustumSeedFragmentShader, {
@@ -775,11 +855,15 @@ export class AmitabhaRadianceField {
     this.displayMaterial = new THREE.ShaderMaterial({
       uniforms: {
         uIrradiance: { value: this.fieldTargets[0].texture },
+        uBackgroundTexture: { value: this.fieldTargets[0].texture },
+        uBackgroundEnabled: { value: 0 },
+        uBackgroundOpacity: { value: 0.2 },
         uDisplayRoll: { value: 0 },
         uWorldBounds: { value: AMITABHA_WORLD_BOUNDS.clone() },
         uFieldTexel: {
           value: new THREE.Vector2(1 / this.fieldExtent, 1 / this.fieldExtent),
         },
+        uResolveSharpness: { value: 0.42 },
       },
       vertexShader: displayVertexShader,
       fragmentShader: displayFragmentShader,
@@ -811,9 +895,29 @@ export class AmitabhaRadianceField {
     this.displayMaterial.uniforms.uDisplayRoll.value = radians;
   }
 
+  setDisplaySharpness(amount: number): void {
+    this.displayMaterial.uniforms.uResolveSharpness.value = Math.max(
+      0,
+      Math.min(1, amount),
+    );
+  }
+
+  setBackgroundTexture(texture: THREE.Texture): void {
+    this.displayMaterial.uniforms.uBackgroundTexture.value = texture;
+  }
+
+  setBackgroundEnabled(active: boolean): void {
+    this.displayMaterial.uniforms.uBackgroundEnabled.value = active ? 1 : 0;
+  }
+
+  setExternalScene(texture: THREE.Texture | null): void {
+    this.sceneMaterial.uniforms.uExternalSceneEnabled.value = texture !== null;
+    if (texture) this.sceneMaterial.uniforms.uExternalScene.value = texture;
+  }
+
   setQuality(quality: 'high' | 'safe'): void {
     const resolution = quality === 'high' ? HIGH_FIELD_EXTENT : SAFE_FIELD_EXTENT;
-    this.frustumsPerStep = quality === 'high' ? DEFAULT_FRUSTUMS_PER_STEP : 1;
+    this.frustumsPerStep = DEFAULT_FRUSTUMS_PER_STEP;
     if (resolution === this.fieldExtent) return;
 
     this.disposeTargets();
@@ -837,7 +941,7 @@ export class AmitabhaRadianceField {
     mesh.position.set(
       (AMITABHA_WORLD_BOUNDS.x + AMITABHA_WORLD_BOUNDS.z) * 0.5,
       (AMITABHA_WORLD_BOUNDS.y + AMITABHA_WORLD_BOUNDS.w) * 0.5,
-      -0.22,
+      AMITABHA_DISPLAY_Z,
     );
     mesh.frustumCulled = false;
     mesh.renderOrder = 0;
@@ -860,11 +964,11 @@ export class AmitabhaRadianceField {
         body.albedo[0],
         body.albedo[1],
         body.albedo[2],
-        9,
+        Math.max(0, body.absorption ?? 9),
       );
       this.bodyMeta[index].set(
         body.sides ?? 0,
-        0,
+        Math.max(0, Math.min(0.98, body.innerRadius ?? 0)),
         1,
         1,
       );

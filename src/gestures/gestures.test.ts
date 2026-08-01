@@ -134,6 +134,6 @@ describe('mapeo de escenas', () => {
     const exported = machine.showConfig;
     exported.scenes[0].nombre = 'No debe filtrar';
     expect(machine.scene.nombre).toBe('Cambio importado');
-    expect(machine.scenes).toHaveLength(6);
+    expect(machine.scenes).toHaveLength(10);
   });
 });

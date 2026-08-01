@@ -1,6 +1,6 @@
 # Visuales reactivas a piano en vivo
 
-Primera versión operable del sistema descrito en los planes del proyecto: micrófono → `FeatureFrame` → gestos con estado → visual WebGL, con panel de dirección, seis escenas y controles de emergencia.
+Versión operable del sistema descrito en los planes del proyecto: micrófono → `FeatureFrame` → gestos con estado → visual WebGL, con panel de dirección, diez escenas y controles de emergencia.
 
 ## Arranque
 
@@ -37,9 +37,15 @@ Para separar visual y controles en dos ventanas de la misma máquina/navegador:
 
 ## Controles de show
 
-- `1`–`6`: cambiar escena.
+- `1`–`9`: cambiar a las escenas 1–9; `0`: cambiar a la escena 10.
 - `Espacio`: forzar estallido.
 - `B`: blackout / restaurar.
+- `Q`: activar o suspender la gravedad en `03 · BLOQUES`.
+- `W`: girar manualmente 90° la escena de bloques; ya no gira sola.
+- `E`: llevar el objeto iluminado —render, luz, colisión y masa Box2D— de 1× a 3×, o de vuelta a 1×, en 10 segundos.
+- `R`: reiniciar los cuerpos Box2D.
+- En `10 · Órbita de Penumbra`, `A/S/D/F/G` cambian respectivamente la
+  apariencia, escala, posición, foco luminoso y gama de color.
 - `P`: mostrar u ocultar el panel embebido.
 
 El panel permite recalibrar 10 segundos, congelar gestos, forzar eventos,
@@ -62,6 +68,26 @@ El atlas de 4096×4096 reúne 64 recortes de fuentes NASA/USGS y se filtra con
 mipmaps y anisotropía para conservar detalle durante la respiración de cámara.
 Las fuentes y el generador reproducible están en
 [`docs/satellite-atlas-sources.md`](docs/satellite-atlas-sources.md).
+
+La escena `08 · Materia viscoelástica` integra como módulo nativo la simulación
+MIT de
+[`kotsoft/particle_based_viscoelastic_fluid`](https://github.com/kotsoft/particle_based_viscoelastic_fluid).
+Conserva hashing espacial, relajación de doble densidad, viscosidad y resortes
+plásticos, pero se renderiza con `THREE.Points` dentro del canvas del show. Se
+mueve de forma autónoma sin micrófono; las notas y eventos musicales aplican
+impulsos. La procedencia, revisión fijada y correspondencia de archivos están
+documentadas en [`docs/viscoelastic-fluid.md`](docs/viscoelastic-fluid.md).
+
+La escena `09 · Materia radiante` conserva esa misma simulación, pero rasteriza
+los blobs en cada frame como emisividad y absorción para usarlos como entrada
+del transporte Holographic Radiance Cascades. La escena `08` permanece sin HRC
+para poder comparar ambas versiones desde botones separados.
+
+La escena `10 · Órbita de Penumbra` es un instrumento visual manual, sin física
+ni gestos automáticos. Un disco, un anillo elíptico hueco y cuerpos orbitales
+proyectan eclipses dentro de Radiance Cascades. Cada pulsación de `A/S/D/F/G`
+elige un nuevo estado objetivo y la transición se interpola suavemente; `F`
+mantiene uno o dos elementos emisivos para conservar sombras legibles.
 
 ## Arquitectura y decisión de análisis
 

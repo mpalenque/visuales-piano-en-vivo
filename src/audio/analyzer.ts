@@ -15,6 +15,24 @@ const initialStatus: AudioStatus = {
   calibrating: false,
 };
 
+const isLocalOrigin = (): boolean => (
+  window.location.hostname === 'localhost'
+  || window.location.hostname === '127.0.0.1'
+  || window.location.hostname === '[::1]'
+);
+
+const audioErrorMessage = (error: unknown): string => {
+  if (error instanceof DOMException) {
+    if (error.name === 'NotAllowedError' || error.name === 'SecurityError') {
+      return 'Chrome bloqueó el micrófono. Permitilo en el candado de la barra y volvé a pulsar Iniciar micrófono.';
+    }
+    if (error.name === 'NotFoundError') return 'No se encontró ningún micrófono disponible.';
+    if (error.name === 'NotReadableError') return 'El micrófono está ocupado por otra aplicación.';
+    if (error.name === 'AbortError') return 'Chrome interrumpió la apertura del micrófono. Volvé a intentarlo.';
+  }
+  return error instanceof Error ? error.message : 'No se pudo abrir el micrófono.';
+};
+
 /** Browser audio input plus a bounded feature queue consumed by the gesture engine. */
 export class LiveAudioAnalyzer {
   private context: AudioContext | null = null;
@@ -57,7 +75,14 @@ export class LiveAudioAnalyzer {
   private async open(runId: number): Promise<void> {
     try {
       this.patchStatus({ state: 'requesting-permission', running: false, error: null });
-      this.stream = await navigator.mediaDevices.getUserMedia({
+      const mediaDevices = navigator.mediaDevices;
+      if (!mediaDevices?.getUserMedia) {
+        if (!window.isSecureContext && !isLocalOrigin()) {
+          throw new Error('El micrófono requiere HTTPS o localhost. Abrí http://localhost:5174/ en esta misma máquina.');
+        }
+        throw new Error('Este navegador no expone la API de micrófono. Usá Chrome o Edge actualizado.');
+      }
+      this.stream = await mediaDevices.getUserMedia({
         audio: {
           autoGainControl: false,
           echoCancellation: false,
@@ -72,8 +97,12 @@ export class LiveAudioAnalyzer {
       this.inputTrack = this.stream.getAudioTracks()[0] ?? null;
       this.inputTrack?.addEventListener('ended', this.onTrackEnded);
       this.patchStatus({ state: 'starting' });
-      this.context = new AudioContext({ latencyHint: 'interactive' });
+      const AudioContextConstructor = window.AudioContext
+        ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextConstructor) throw new Error('Este navegador no soporta Web Audio. Usá Chrome o Edge actualizado.');
+      this.context = new AudioContextConstructor({ latencyHint: 'interactive' });
       this.context.addEventListener('statechange', this.onContextStateChange);
+      if (!this.context.audioWorklet) throw new Error('Este navegador no soporta AudioWorklet. Usá Chrome o Edge actualizado.');
       await this.context.audioWorklet.addModule(featureWorkletUrl);
       if (runId !== this.runId) {
         this.stop();
@@ -90,11 +119,12 @@ export class LiveAudioAnalyzer {
       source.connect(this.node).connect(this.silentGain).connect(this.context.destination);
       this.node.port.onmessage = ({ data }: MessageEvent) => this.receive(data);
       await this.context.resume();
+      if (this.context.state !== 'running') throw new Error('El contexto de audio quedó suspendido. Volvé a pulsar Iniciar micrófono.');
       this.patchStatus({ state: 'running', running: true, sampleRate: this.context.sampleRate, error: null });
       this.recalibrate();
     } catch (error) {
       this.stop();
-      this.patchStatus({ state: 'error', error: error instanceof Error ? error.message : 'No se pudo abrir el micrófono.' });
+      this.patchStatus({ state: 'error', error: audioErrorMessage(error) });
       throw error;
     }
   }

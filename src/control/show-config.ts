@@ -38,7 +38,18 @@ export const gestureParamDefinitions = {
 export type GestureId = keyof typeof gestureParamDefinitions;
 export type GestureParamKey<G extends GestureId = GestureId> = keyof (typeof gestureParamDefinitions)[G] & string;
 
-export const visualParameterTargets = ['tension', 'density', 'hue', 'brightness', 'turbulence', 'zoom', 'grain', 'saturation'] as const;
+export const visualParameterTargets = [
+  'tension',
+  'density',
+  'hue',
+  'brightness',
+  'turbulence',
+  'zoom',
+  'grain',
+  'saturation',
+  'radiance',
+  'beat',
+] as const;
 export const visualEventTargets = ['explosion', 'pulse', 'climax', 'finale'] as const;
 
 const curves: readonly Curve[] = ['linear', 'exp', 'log', 'sCurve'];
@@ -129,11 +140,15 @@ function normalizeWire(value: unknown, path: string): Wire {
 function normalizeScene(value: unknown, index: number): Scene {
   const path = `scenes[${index}]`;
   const source = expectRecord(value, path);
-  const id = expectInteger(source.id, `${path}.id`, 1, 6);
+  const id = expectInteger(source.id, `${path}.id`, 1, 10);
   const nombre = expectString(source.nombre, `${path}.nombre`, 80);
   const notes = expectString(source.notes, `${path}.notes`, 500);
-  const visualScene = expectInteger(source.visualScene, `${path}.visualScene`, 1, 6);
-  if (!Array.isArray(source.gestosActivos) || source.gestosActivos.length < 1 || source.gestosActivos.length > 6) throw new Error(`${path}.gestosActivos no es válido.`);
+  const visualScene = expectInteger(source.visualScene, `${path}.visualScene`, 1, 10);
+  if (
+    !Array.isArray(source.gestosActivos)
+    || source.gestosActivos.length > 6
+    || (id !== 10 && source.gestosActivos.length < 1)
+  ) throw new Error(`${path}.gestosActivos no es válido.`);
   const gestosActivos = source.gestosActivos.map((gesture, gestureIndex) => {
     const idValue = expectString(gesture, `${path}.gestosActivos[${gestureIndex}]`, 64);
     if (!isGestureId(idValue)) throw new Error(`${path}.gestosActivos[${gestureIndex}] no existe.`);
@@ -159,7 +174,14 @@ function normalizeScene(value: unknown, index: number): Scene {
   }
   const baseParams = Object.fromEntries(visualParameterTargets.map((target) => [
     target,
-    expectNumber(baseSource[target], `${path}.baseParams.${target}`, target === 'hue' ? 0 : 0, target === 'hue' ? 360 : target === 'zoom' ? 3 : 1),
+    expectNumber(
+      baseSource[target] ?? (
+        target === 'radiance' || target === 'beat' ? 0 : undefined
+      ),
+      `${path}.baseParams.${target}`,
+      0,
+      target === 'hue' ? 360 : target === 'zoom' ? 3 : 1,
+    ),
   ]));
   return { id, nombre, visualScene, gestosActivos, presets, wires, transicionEntrada: { tipo, seg }, baseParams, notes };
 }
@@ -167,10 +189,21 @@ function normalizeScene(value: unknown, index: number): Scene {
 export function parseShowConfig(value: unknown): ShowConfig {
   const source = expectRecord(value, 'configuración');
   if (source.version !== 2) throw new Error('La versión del preset no es compatible.');
-  if (!Array.isArray(source.scenes) || source.scenes.length !== 6) throw new Error('El preset debe contener exactamente seis escenas.');
-  const scenes = source.scenes.map(normalizeScene);
+  if (!Array.isArray(source.scenes) || source.scenes.length < 6 || source.scenes.length > 10) {
+    throw new Error('El preset debe contener entre seis y diez escenas.');
+  }
+  // Los shows guardados antes de las escenas 7, 8, 9 y 10 siguen siendo válidos:
+  // se añaden únicamente las escenas nuevas sin tocar las ya configuradas.
+  const sourceScenes = [...source.scenes];
+  for (const defaultScene of createDefaultScenes()) {
+    const alreadyPresent = sourceScenes.some((scene) => isRecord(scene) && scene.id === defaultScene.id);
+    if (!alreadyPresent) sourceScenes.push(defaultScene);
+  }
+  const scenes = sourceScenes.map(normalizeScene);
   const ids = scenes.map((scene) => scene.id);
-  if (new Set(ids).size !== 6 || ![1, 2, 3, 4, 5, 6].every((id) => ids.includes(id))) throw new Error('Los ids de escena deben ser únicos y cubrir 1–6.');
+  if (new Set(ids).size !== 10 || ![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].every((id) => ids.includes(id))) {
+    throw new Error('Los ids de escena deben ser únicos y cubrir 1–10.');
+  }
   return { version: 2, scenes };
 }
 

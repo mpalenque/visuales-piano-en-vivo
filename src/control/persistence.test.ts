@@ -27,7 +27,7 @@ describe('persistencia y escenas', () => {
 
   it('falla de forma segura ante storage corrupto y migra presets heredados', () => {
     const corrupt = loadShowConfig(memoryStorage({ [SHOW_CONFIG_STORAGE_KEY]: '{no-json' }));
-    expect(corrupt.config.scenes).toHaveLength(6);
+    expect(corrupt.config.scenes).toHaveLength(10);
     expect(corrupt.warning).toContain('Se ignoró un preset local inválido');
 
     const legacy = memoryStorage({ [LEGACY_SCENES_STORAGE_KEY]: JSON.stringify(createDefaultScenes()) });
@@ -41,7 +41,7 @@ describe('persistencia y escenas', () => {
     const second = createDefaultScenes();
     first[0].nombre = 'Mutación local';
     expect(second[0].nombre).not.toBe('Mutación local');
-    expect(sceneById(second, 6).visualScene).toBe(6);
-    expect(() => sceneById(second, 7)).toThrow('No existe la escena 7');
+    expect(sceneById(second, 10).visualScene).toBe(10);
+    expect(() => sceneById(second, 11)).toThrow('No existe la escena 11');
   });
 });

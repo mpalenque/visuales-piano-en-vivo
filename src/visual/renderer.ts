@@ -1,8 +1,14 @@
 import * as THREE from 'three';
-import { Box, Edge, Polygon, Vec2, World } from 'planck-js';
+import radianceBackgroundUrl from '../../nube.webp';
+import { Box, Circle, Edge, Polygon, Vec2, World, type Fixture } from 'planck-js';
 import type { DetectedNote, GestureEvent, ImpulseMode, RendererStatus, VisualFrame } from '../types';
 import forestAtlasUrl from '../assets/forest-satellite-atlas-8x8.jpg';
-import { AMITABHA_WORLD_BOUNDS, AmitabhaRadianceField, type AmitabhaBody } from './amitabha-radiance-field';
+import {
+  AMITABHA_DISPLAY_Z,
+  AMITABHA_WORLD_BOUNDS,
+  AmitabhaRadianceField,
+  type AmitabhaBody,
+} from './amitabha-radiance-field';
 import {
   ForwardCaustics,
   forwardOpticalMaterialForIndex,
@@ -11,8 +17,15 @@ import {
   type ForwardOpticalMaterial,
   type ForwardVec2,
 } from './forward-caustics';
+import { DynamicOpticalField, type DynamicOpticalBody, type DynamicOpticalMaterial } from './dynamic-optical-field';
+import { OpticalLab } from './optical-lab';
 import { polygonSidesForSound, regulatedPackingChaos } from './packing-dynamics';
 import { visualProfileById } from './profiles';
+import {
+  RadianceComposition,
+  type RadianceCompositionControl,
+} from './radiance-composition';
+import { ViscoelasticFluidField } from './viscoelastic-fluid/field';
 import { MAX_VORONOI_CELLS, VoronoiField, type VoronoiCellSnapshot } from './voronoi-field';
 
 // Deliberately small: this renderer is the MVP/concept visual, not the final
@@ -29,11 +42,24 @@ const BLOCK_HALF_WIDTH = 4.45;
 const BLOCK_BOTTOM = -2.75;
 const BLOCK_TOP = 2.85;
 const PACKING_FLOOR_HALF_WIDTH = 4.8;
-const PACKING_ROTATION_INTERVAL = 6;
 const PACKING_ROTATION_DURATION = 0.82;
 const PACKING_FLOOR_WAVE_DURATION = 5;
 const PACKING_FLOOR_WAVE_AMPLITUDE = 0.34;
 const MAX_FRAME_SAMPLES = 180;
+const LEGACY_MATERIAL_CYCLE_SECONDS = 12;
+const LEGACY_EMITTER_MIN = 3;
+const LEGACY_EMITTER_MAX = 7;
+const LEGACY_EMITTER_SCALE_DURATION = 10;
+const LEGACY_EMITTER_SCALE_MIN = 1;
+const LEGACY_EMITTER_SCALE_MAX = 3;
+const LEGACY_PHYSICS_SCALE_STEP = 0.025;
+const LEGACY_OPAQUE_COLOURS = [0x7d8795, 0x8b6f7e, 0x657d83, 0x897d62] as const;
+const LEGACY_EMITTER_COLOURS = [
+  { body: 0xff6b50, emission: [1, 0.08, 0.025] as const },
+  { body: 0x599fff, emission: [0.035, 0.15, 1] as const },
+  { body: 0xffce68, emission: [1, 0.72, 0.24] as const },
+  { body: 0x78e7c7, emission: [0.08, 1, 0.62] as const },
+] as const;
 
 const damp = (current: number, target: number, speed: number, dt: number): number => current + (target - current) * (1 - Math.exp(-speed * dt));
 const pseudoRandom = (seed: number): number => {
@@ -93,9 +119,12 @@ interface AccumulationParticle {
 }
 
 interface PackingBlock {
-  kind: 'block' | 'polygon';
+  kind: 'block' | 'circle' | 'polygon';
   note: DetectedNote;
   body: PhysicsBody;
+  fixture: Fixture | null;
+  physicsScale: number;
+  baseMass: number;
   width: number;
   height: number;
   color: number;
@@ -104,12 +133,18 @@ interface PackingBlock {
   morphAspect: number;
   morphPhase: number;
   morphSeed: number;
+  // The world point the body sampled when it was born.  Keeping this fixed
+  // lets a moving shape carry a displaced piece of the full-screen image.
+  imageAnchorX: number;
+  imageAnchorY: number;
   emissive: boolean;
   emissionRed: number;
   emissionGreen: number;
   emissionBlue: number;
   emissionStrength: number;
   opticalMaterial: Exclude<ForwardOpticalMaterial, 'emitter'>;
+  dynamicMaterial?: DynamicOpticalMaterial;
+  dynamicPinned?: boolean;
   transportOrder: number;
 }
 
@@ -259,11 +294,21 @@ export class ReactiveVisualRenderer {
   private readonly accumulationPoints = new THREE.Points(this.accumulationGeometry, this.accumulationMaterial);
   private accumulationParticles: AccumulationParticle[] = [];
   private readonly packingIrradiance = { value: null as THREE.Texture | null };
+  // The same full-screen cloud image is sampled again by every Box2D body.
+  // The same texture that is drawn by the full-screen HRC display. Blocks use
+  // it as a projected mask, offset by their Box2D displacement.
+  private readonly packingImage = { value: null as THREE.Texture | null };
+  private readonly packingImageRoll = { value: 0 };
+  // Mode 03 deliberately keeps the pre-optics diffuse block look. This is a
+  // uniform switch in the packing shader, so it has no extra draw calls.
+  private readonly legacyBlocksUniform = { value: 0 };
   private readonly blockGeometry = new THREE.PlaneGeometry(1, 1);
+  private readonly circleGeometry = new THREE.CircleGeometry(0.5, 32);
   private readonly blockMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.97, depthWrite: false });
   private readonly polygonMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.97, depthWrite: false });
   private readonly polygonMorphTime = { value: 0 };
   private readonly blockMesh = new THREE.InstancedMesh(this.blockGeometry, this.blockMaterial, MAX_PACKING_BLOCKS);
+  private readonly circleMesh = new THREE.InstancedMesh(this.circleGeometry, this.blockMaterial, MAX_PACKING_BLOCKS);
   private readonly polygonGeometries = Array.from(
     { length: 6 },
     (_, index) => packingPolygonGeometry(index + 3),
@@ -272,12 +317,24 @@ export class ReactiveVisualRenderer {
   private readonly polygonMorphAmounts = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS));
   private readonly blockEmissionData = new Float32Array(MAX_PACKING_BLOCKS * 4);
   private readonly blockOpticalData = new Float32Array(MAX_PACKING_BLOCKS);
+  private readonly blockImageAnchorData = new Float32Array(MAX_PACKING_BLOCKS * 2);
+  private readonly circleEmissionData = new Float32Array(MAX_PACKING_BLOCKS * 4);
+  private readonly circleOpticalData = new Float32Array(MAX_PACKING_BLOCKS);
+  private readonly circleImageAnchorData = new Float32Array(MAX_PACKING_BLOCKS * 2);
   private readonly polygonEmissionData = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS * 4));
   private readonly polygonOpticalData = Array.from({ length: 6 }, () => new Float32Array(MAX_PACKING_BLOCKS));
+  private readonly polygonImageAnchorData = Array.from(
+    { length: 6 },
+    () => new Float32Array(MAX_PACKING_BLOCKS * 2),
+  );
   private readonly polygonMeshes = this.polygonGeometries.map((geometry) => new THREE.InstancedMesh(geometry, this.polygonMaterial, MAX_PACKING_BLOCKS));
   private readonly amitabhaField: AmitabhaRadianceField;
   private readonly amitabhaDisplay: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private readonly forwardCaustics = new ForwardCaustics();
+  private readonly opticalLab: OpticalLab;
+  private readonly dynamicOpticalField: DynamicOpticalField;
+  private readonly viscoelasticFluid = new ViscoelasticFluidField();
+  private readonly radianceComposition = new RadianceComposition();
   private readonly blockFrameGeometry = new THREE.BufferGeometry();
   private readonly blockFrameMaterial = new THREE.LineBasicMaterial({ color: 0x8c879f, transparent: true, opacity: 0.55 });
   private readonly blockFrame = new THREE.Line(this.blockFrameGeometry, this.blockFrameMaterial);
@@ -303,6 +360,12 @@ export class ReactiveVisualRenderer {
   private packingTurbulenceTarget = 0.1;
   private packingTension = 0.1;
   private packingTensionTarget = 0.1;
+  private legacyMaterialCycleElapsed = 0;
+  private legacyMaterialCycle = 0;
+  private legacyEmitterScale = LEGACY_EMITTER_SCALE_MIN;
+  private legacyEmitterScaleStart = LEGACY_EMITTER_SCALE_MIN;
+  private legacyEmitterScaleTarget: 1 | 3 = LEGACY_EMITTER_SCALE_MIN;
+  private legacyEmitterScaleStartedAt = -Infinity;
   private hrcSlowElapsed = 0;
   private hrcStableElapsed = 0;
   private hrcQuality: RendererStatus['quality'] = 'high';
@@ -347,9 +410,11 @@ export class ReactiveVisualRenderer {
   private voronoiChaseSequence = 0;
   private voronoiLastCellCount = 0;
   private readonly forestTexture: THREE.Texture;
+  private readonly radianceBackgroundTexture: THREE.Texture;
   private readonly voronoiMaterial: THREE.ShaderMaterial;
   private readonly voronoiMesh: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private impulseMode: ImpulseMode = 1;
+  private legacyBlocksActive = false;
   private readonly target: Record<string, number> = {};
   private readonly current: Record<string, number> = {};
   private readonly colour = new THREE.Color();
@@ -378,10 +443,19 @@ export class ReactiveVisualRenderer {
       powerPreference: 'high-performance',
       precision: 'highp',
     });
+    this.opticalLab = new OpticalLab(this.renderer);
+    this.dynamicOpticalField = new DynamicOpticalField(this.renderer);
     this.applyQuality();
     this.renderer.setClearColor(0x030307, 1);
     this.amitabhaField = new AmitabhaRadianceField(this.renderer);
     this.amitabhaField.setQuality(this.quality);
+    this.radianceBackgroundTexture = new THREE.TextureLoader().load(radianceBackgroundUrl);
+    this.radianceBackgroundTexture.colorSpace = THREE.SRGBColorSpace;
+    this.radianceBackgroundTexture.minFilter = THREE.LinearFilter;
+    this.radianceBackgroundTexture.magFilter = THREE.LinearFilter;
+    this.radianceBackgroundTexture.generateMipmaps = true;
+    this.amitabhaField.setBackgroundTexture(this.radianceBackgroundTexture);
+    this.packingImage.value = this.radianceBackgroundTexture;
     this.causticsQuality = this.quality === 'safe' ? 'safe' : 'high';
     this.forwardCaustics.setQuality(this.causticsQuality);
     this.amitabhaDisplay = this.amitabhaField.createDisplayMesh();
@@ -438,6 +512,7 @@ export class ReactiveVisualRenderer {
     });
     this.points = new THREE.Points(geometry, this.material);
     this.scene.add(this.points);
+    this.scene.add(this.viscoelasticFluid.points);
     this.noteGeometry.setAttribute('position', this.notePositionAttribute);
     this.noteGeometry.setAttribute('aAlpha', this.noteAlphaAttribute);
     this.noteGeometry.setAttribute('aSize', this.noteSizeAttribute);
@@ -450,19 +525,31 @@ export class ReactiveVisualRenderer {
     this.scene.add(this.accumulationPoints);
     this.blockGeometry.setAttribute('aEmission', new THREE.InstancedBufferAttribute(this.blockEmissionData, 4));
     this.blockGeometry.setAttribute('aOpticalKind', new THREE.InstancedBufferAttribute(this.blockOpticalData, 1));
+    this.blockGeometry.setAttribute('aPackingImageAnchor', new THREE.InstancedBufferAttribute(this.blockImageAnchorData, 2));
+    this.circleGeometry.setAttribute('aEmission', new THREE.InstancedBufferAttribute(this.circleEmissionData, 4));
+    this.circleGeometry.setAttribute('aOpticalKind', new THREE.InstancedBufferAttribute(this.circleOpticalData, 1));
+    this.circleGeometry.setAttribute('aPackingImageAnchor', new THREE.InstancedBufferAttribute(this.circleImageAnchorData, 2));
     this.polygonGeometries.forEach((geometry, index) => {
       geometry.setAttribute('aMorphSeed', new THREE.InstancedBufferAttribute(this.polygonMorphSeeds[index], 1));
       geometry.setAttribute('aMorphAmount', new THREE.InstancedBufferAttribute(this.polygonMorphAmounts[index], 1));
       geometry.setAttribute('aEmission', new THREE.InstancedBufferAttribute(this.polygonEmissionData[index], 4));
       geometry.setAttribute('aOpticalKind', new THREE.InstancedBufferAttribute(this.polygonOpticalData[index], 1));
+      geometry.setAttribute('aPackingImageAnchor', new THREE.InstancedBufferAttribute(this.polygonImageAnchorData[index], 2));
     });
-    this.packingGroup.add(this.amitabhaDisplay);
+    this.amitabhaDisplay.visible = false;
+    this.scene.add(this.amitabhaDisplay);
     this.blockMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.blockMesh.count = 0;
     this.blockMesh.visible = false;
     this.blockMesh.frustumCulled = false;
     this.blockMesh.renderOrder = 1;
     this.packingGroup.add(this.blockMesh);
+    this.circleMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.circleMesh.count = 0;
+    this.circleMesh.visible = false;
+    this.circleMesh.frustumCulled = false;
+    this.circleMesh.renderOrder = 1;
+    this.packingGroup.add(this.circleMesh);
     this.polygonMeshes.forEach((mesh) => {
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       mesh.count = 0;
@@ -493,10 +580,55 @@ export class ReactiveVisualRenderer {
 
   apply(frame: VisualFrame): void {
     this.blackout = frame.blackout;
+    const opticalLabActive = frame.scene === 6;
+    const dynamicOpticalActive = frame.scene === 7;
+    const viscoelasticActive = frame.scene === 8 || frame.scene === 9;
+    const viscoelasticRadianceActive = frame.scene === 9;
+    const radianceCompositionActive = frame.scene === 10;
+    const enteringRadianceComposition =
+      radianceCompositionActive && this.activeScene !== 10;
+    this.legacyBlocksActive = !opticalLabActive
+      && !dynamicOpticalActive
+      && !viscoelasticActive
+      && !radianceCompositionActive
+      && frame.impulseMode === 3;
+    this.legacyBlocksUniform.value = this.legacyBlocksActive ? 1 : 0;
+    this.opticalLab.setActive(opticalLabActive);
+    this.dynamicOpticalField.setActive(dynamicOpticalActive);
+    this.viscoelasticFluid.setActive(viscoelasticActive);
+    this.viscoelasticFluid.setRadianceMode(viscoelasticRadianceActive);
+    this.viscoelasticFluid.setParams(frame.params);
+    this.viscoelasticFluid.setMusicAnalysis(frame.music);
+    this.amitabhaField.setDisplaySharpness(
+      viscoelasticRadianceActive ? 0.78 : 0.42,
+    );
+    // The cloud remains available to the Box2D mask shader, but never paints
+    // the full-screen background in any scene (including the fluid pass).
+    this.amitabhaField.setBackgroundEnabled(false);
+    this.amitabhaField.setExternalScene(
+      viscoelasticRadianceActive
+        ? this.viscoelasticFluid.radianceSourceTexture
+        : null,
+    );
+    if (enteringRadianceComposition) {
+      this.clearPackingBlocks();
+      this.amitabhaField.reset();
+    }
+    if (!dynamicOpticalActive && this.activeScene === 7) {
+      // Scene 7 changes Box2D gravity and creates its own material rig. Its
+      // bodies must never survive into the original diffuse HRC block mode.
+      this.clearPackingBlocks();
+    } else if (dynamicOpticalActive && this.activeScene !== 7) {
+      this.clearPackingBlocks();
+      this.seedDynamicOpticalScene();
+    }
     const modeChanged = this.impulseMode !== frame.impulseMode;
     this.impulseMode = frame.impulseMode;
     if (modeChanged && this.impulseMode === 2) this.clearAccumulation();
-    if (modeChanged && (this.impulseMode === 3 || this.impulseMode === 5)) this.clearPackingBlocks();
+    if (modeChanged && (this.impulseMode === 3 || this.impulseMode === 5)) {
+      this.clearPackingBlocks();
+      if (this.impulseMode === 3) this.forwardCaustics.reset();
+    }
     if (modeChanged && this.impulseMode !== 3 && this.impulseMode !== 5) this.resetPackingCamera();
     if (modeChanged && this.impulseMode === 4) {
       this.voronoiField.reset();
@@ -504,22 +636,43 @@ export class ReactiveVisualRenderer {
       this.flash = 0;
       this.pulse = 0;
     }
-    const baseFieldVisible = ![1, 2, 3, 4, 5].includes(this.impulseMode);
+    const baseFieldVisible = !opticalLabActive && !dynamicOpticalActive
+      && !viscoelasticActive
+      && !radianceCompositionActive
+      && ![1, 2, 3, 4, 5].includes(this.impulseMode);
     this.points.visible = baseFieldVisible;
     if (this.outgoing) this.outgoing.visible = baseFieldVisible;
     this.packingDensityTarget = Math.max(0, Math.min(1, frame.params.density ?? 0.2));
     this.packingTurbulenceTarget = Math.max(0, Math.min(1, frame.params.turbulence ?? 0.1));
     this.packingTensionTarget = Math.max(0, Math.min(1, frame.params.tension ?? 0.1));
-    if (this.impulseMode === 1) frame.noteAttacks.forEach((note) => this.spawnNoteParticle(note));
-    if (this.impulseMode === 2) frame.noteAttacks.forEach((note) => this.spawnAccumulationParticle(note));
-    if (this.impulseMode === 3) frame.noteAttacks.forEach((note) => this.spawnPackingBlock(note));
-    if (this.impulseMode === 5) frame.noteAttacks.forEach((note) => this.spawnPackingPolygon(note));
-    if ((this.impulseMode === 3 || this.impulseMode === 5) && frame.wideChord) this.togglePackingGravity();
-    if (this.impulseMode === 4) frame.noteAttacks.forEach((note) => this.applyVoronoiImpulse(note));
-    const packingVisible = this.impulseMode === 3 || this.impulseMode === 5;
+    if (!viscoelasticActive && !radianceCompositionActive && this.impulseMode === 1) frame.noteAttacks.forEach((note) => this.spawnNoteParticle(note));
+    if (!viscoelasticActive && !radianceCompositionActive && this.impulseMode === 2) frame.noteAttacks.forEach((note) => this.spawnAccumulationParticle(note));
+    if (!dynamicOpticalActive && !viscoelasticActive && !radianceCompositionActive && this.impulseMode === 3) frame.noteAttacks.forEach((note) => this.spawnPackingBurst(note));
+    if (!dynamicOpticalActive && !viscoelasticActive && !radianceCompositionActive && this.impulseMode === 5) frame.noteAttacks.forEach((note) => this.spawnPackingPolygon(note));
+    if (dynamicOpticalActive) frame.noteAttacks.forEach((note) => this.spawnPackingBlock(note));
+    if (viscoelasticActive) frame.noteAttacks.forEach((note) => this.viscoelasticFluid.splash(note));
+    if (!dynamicOpticalActive && !viscoelasticActive && !radianceCompositionActive && (this.impulseMode === 3 || this.impulseMode === 5) && frame.wideChord) this.togglePackingGravity();
+    if (dynamicOpticalActive && frame.wideChord) this.togglePackingGravity();
+    if (!viscoelasticActive && !radianceCompositionActive && this.impulseMode === 4) frame.noteAttacks.forEach((note) => this.applyVoronoiImpulse(note));
+    const packingVisible = !opticalLabActive && !dynamicOpticalActive
+      && !viscoelasticActive
+      && !radianceCompositionActive
+      && (this.impulseMode === 3 || this.impulseMode === 5);
     this.blockFrame.visible = packingVisible;
     this.packingGroup.visible = packingVisible;
-    this.voronoiMesh.visible = this.impulseMode === 4;
+    this.amitabhaDisplay.visible = packingVisible
+      || viscoelasticRadianceActive
+      || radianceCompositionActive;
+    this.forwardCaustics.points.visible = packingVisible && !this.legacyBlocksActive;
+    this.voronoiMesh.visible = !opticalLabActive && !dynamicOpticalActive
+      && !viscoelasticActive
+      && !radianceCompositionActive
+      && this.impulseMode === 4;
+    if (viscoelasticActive || radianceCompositionActive) {
+      this.notePoints.visible = false;
+      this.accumulationPoints.visible = false;
+      this.resetPackingCamera();
+    }
     const changedScene = this.activeScene !== null && this.activeScene !== frame.scene;
     if (changedScene) {
       this.disposeOutgoing();
@@ -549,6 +702,7 @@ export class ReactiveVisualRenderer {
     if (this.restorePending) {
       this.amitabhaField.reset();
       this.forwardCaustics.reset();
+      this.opticalLab.reset();
       this.resetFrameTimingWindow();
       this.packingIrradiance.value = this.amitabhaField.texture;
       this.renderer.compile(this.scene, this.camera);
@@ -556,11 +710,72 @@ export class ReactiveVisualRenderer {
       this.restorePending = false;
     }
 
+    if (this.activeScene === 6) {
+      if (this.blackout) {
+        this.renderer.setClearColor(0x000000, 1);
+        this.renderer.clear();
+        return;
+      }
+      this.opticalLab.render();
+      return;
+    }
+
+    if (this.activeScene === 10) {
+      if (this.blackout) {
+        this.renderer.setClearColor(0x000000, 1);
+        this.renderer.clear();
+        return;
+      }
+      this.camera.position.set(0, 0, 8.5);
+      this.camera.rotation.set(0, 0, 0);
+      this.amitabhaField.setExternalScene(null);
+      this.amitabhaField.setBodies(this.radianceComposition.update(dt));
+      this.amitabhaField.render();
+      this.packingIrradiance.value = this.amitabhaField.texture;
+      this.syncAmitabhaDisplayToCamera();
+      this.renderer.setClearColor(0x000107, 1);
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
+
+    if (this.activeScene === 8 || this.activeScene === 9) {
+      if (this.blackout) {
+        this.renderer.setClearColor(0x000000, 1);
+        this.renderer.clear();
+        return;
+      }
+      this.camera.position.set(0, 0, 8.5);
+      this.camera.rotation.set(0, 0, 0);
+      this.viscoelasticFluid.update(dt, elapsed);
+      if (this.activeScene === 9) {
+        this.viscoelasticFluid.renderRadianceSource(this.renderer);
+        this.amitabhaField.setBodies([]);
+        this.amitabhaField.setExternalScene(
+          this.viscoelasticFluid.radianceSourceTexture,
+        );
+        this.amitabhaField.render();
+        this.packingIrradiance.value = this.amitabhaField.texture;
+        this.syncAmitabhaDisplayToCamera();
+      }
+      this.renderer.setClearColor(0x01050b, 1);
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
+
     this.flash = Math.max(0, this.flash - dt * 3.4);
     this.pulse = Math.max(0, this.pulse - dt * 2.8);
     this.updateNoteParticles(dt);
     this.updateAccumulationParticles(dt);
     this.updatePackingBlocks(dt, elapsed);
+    if (this.activeScene === 7) {
+      if (this.blackout) {
+        this.renderer.setClearColor(0x000000, 1);
+        this.renderer.clear();
+        return;
+      }
+      this.dynamicOpticalField.render();
+      return;
+    }
     const defaults: Record<string, number> = { tension: 0.1, density: 0.2, turbulence: 0.1, zoom: 1, hue: 220, brightness: 0.35, saturation: 0.8, profile: 1 };
     for (const [key, fallback] of Object.entries(defaults)) {
       this.current[key] = key === 'profile'
@@ -614,12 +829,16 @@ export class ReactiveVisualRenderer {
     this.accumulationGeometry.dispose();
     this.accumulationMaterial.dispose();
     this.blockGeometry.dispose();
+    this.circleGeometry.dispose();
     this.polygonGeometries.forEach((geometry) => geometry.dispose());
     this.blockMaterial.dispose();
     this.polygonMaterial.dispose();
     this.amitabhaDisplay.geometry.dispose();
     this.amitabhaField.dispose();
     this.forwardCaustics.dispose();
+    this.opticalLab.dispose();
+    this.dynamicOpticalField.dispose();
+    this.viscoelasticFluid.dispose();
     this.blockFrameGeometry.dispose();
     this.blockFrameMaterial.dispose();
     this.voronoiGeometry.dispose();
@@ -631,6 +850,13 @@ export class ReactiveVisualRenderer {
 
   getStatus(): RendererStatus {
     const canvas = this.renderer.domElement;
+    const opticalLab = this.opticalLab.stats;
+    const opticalLabActive = this.activeScene === 6 && opticalLab.active;
+    const dynamicOptics = this.dynamicOpticalField.stats;
+    const dynamicOpticsActive = this.activeScene === 7 && dynamicOptics.active;
+    const viscoelastic = this.viscoelasticFluid.stats;
+    const radianceComposition = this.radianceComposition.stats;
+    const legacyEmitter = this.packingBlocks.find((block) => block.emissive);
     return {
       state: this.contextState,
       quality: this.quality,
@@ -646,22 +872,81 @@ export class ReactiveVisualRenderer {
       tabVisible: document.visibilityState === 'visible',
       voronoiCells: this.voronoiField.count,
       packingGravityEnabled: this.packingGravityEnabled,
+      packingCameraRotationDegrees: this.packingCameraRotation * 180 / Math.PI,
+      packingEmitterScale: this.legacyEmitterScale,
+      packingEmitterScaleTarget: this.legacyEmitterScaleTarget,
+      packingEmitterPhysicsScale: legacyEmitter?.physicsScale ?? 1,
+      packingEmitterMassScale: legacyEmitter && legacyEmitter.baseMass > 0
+        ? legacyEmitter.body.getMass() / legacyEmitter.baseMass
+        : 1,
+      fluidActive: (this.activeScene === 8 || this.activeScene === 9)
+        && viscoelastic.active,
+      fluidParticleCount: viscoelastic.particleCount,
+      fluidSpringCount: viscoelastic.springCount,
+      radianceCompositionActive: this.activeScene === 10,
+      radianceCompositionForm: radianceComposition.form,
+      radianceCompositionScale: radianceComposition.scale,
+      radianceCompositionScaleTarget: radianceComposition.scaleTarget,
+      radianceCompositionLayout: radianceComposition.layout,
+      radianceCompositionFocus: radianceComposition.focus,
+      radianceCompositionPalette: radianceComposition.palette,
+      radianceCompositionEmitterCount: radianceComposition.emitterCount,
       hrcResolution: this.amitabhaField.stats.resolution,
       hrcUpdateHz: this.amitabhaField.stats.updateHz,
       hrcFrustumsPerFrame: this.amitabhaField.stats.frustumsPerFrame,
       hrcTargetMemoryBytes: this.amitabhaField.stats.targetMemoryBytes,
       hrcDrawCalls: this.amitabhaField.stats.drawCalls,
-      causticsActive: this.forwardCaustics.stats.active,
-      causticsQuality: this.forwardCaustics.stats.quality,
-      causticsEmitterCount: this.forwardCaustics.stats.emitterCount,
-      causticsMaterialCount: this.forwardCaustics.stats.materialCount,
-      causticsRayCount: this.forwardCaustics.stats.rayCount,
-      causticsHitCount: this.forwardCaustics.stats.hitCount,
-      causticsPointCount: this.forwardCaustics.stats.pointCount,
-      causticsUpdateHz: this.forwardCaustics.stats.updateHz,
-      causticsCpuTimeMs: this.forwardCaustics.stats.cpuTimeMs,
-      causticsDrawCalls: this.forwardCaustics.stats.drawCalls,
-      causticsTargetMemoryBytes: this.forwardCaustics.stats.targetMemoryBytes,
+      causticsActive: opticalLabActive || dynamicOpticsActive || this.forwardCaustics.stats.active,
+      causticsQuality: opticalLabActive
+        ? opticalLab.quality
+        : dynamicOpticsActive
+          ? dynamicOptics.quality
+        : this.forwardCaustics.stats.quality,
+      causticsEmitterCount: opticalLabActive
+        ? 1
+        : dynamicOpticsActive
+          ? dynamicOptics.emitterCount
+        : this.forwardCaustics.stats.emitterCount,
+      causticsMaterialCount: opticalLabActive
+        ? 4
+        : dynamicOpticsActive
+          ? dynamicOptics.opticalCount
+        : this.forwardCaustics.stats.materialCount,
+      causticsRayCount: opticalLabActive
+        ? opticalLab.samplesPerPixel
+        : dynamicOpticsActive
+          ? dynamicOptics.rayCount
+        : this.forwardCaustics.stats.rayCount,
+      causticsHitCount: opticalLabActive
+        ? opticalLab.accumulatedFrames
+        : dynamicOpticsActive
+          ? dynamicOptics.bodyCount
+        : this.forwardCaustics.stats.hitCount,
+      causticsPointCount: opticalLabActive
+        ? 0
+        : dynamicOpticsActive
+          ? 0
+        : this.forwardCaustics.stats.pointCount,
+      causticsUpdateHz: opticalLabActive
+        ? (this.frameTimeAverageMs > 0 ? 1000 / this.frameTimeAverageMs : 0)
+        : dynamicOpticsActive
+          ? (this.frameTimeAverageMs > 0 ? 1000 / this.frameTimeAverageMs : 0)
+        : this.forwardCaustics.stats.updateHz,
+      causticsCpuTimeMs: opticalLabActive
+        ? opticalLab.cpuTimeMs
+        : dynamicOpticsActive
+          ? dynamicOptics.cpuTimeMs
+        : this.forwardCaustics.stats.cpuTimeMs,
+      causticsDrawCalls: opticalLabActive
+        ? opticalLab.drawCalls
+        : dynamicOpticsActive
+          ? dynamicOptics.drawCalls
+        : this.forwardCaustics.stats.drawCalls,
+      causticsTargetMemoryBytes: opticalLabActive
+        ? opticalLab.targetMemoryBytes
+        : dynamicOpticsActive
+          ? dynamicOptics.targetMemoryBytes
+        : this.forwardCaustics.stats.targetMemoryBytes,
     };
   }
 
@@ -674,6 +959,9 @@ export class ReactiveVisualRenderer {
     this.causticsSlowElapsed = 0;
     this.causticsStableElapsed = 0;
     this.forwardCaustics.setQuality(this.causticsQuality);
+    this.opticalLab.setQuality(quality);
+    this.dynamicOpticalField.setQuality(quality);
+    this.viscoelasticFluid.setQuality(quality);
     this.resetFrameTimingWindow();
     this.amitabhaField.setQuality(quality);
     this.resize();
@@ -683,10 +971,20 @@ export class ReactiveVisualRenderer {
     this.clearPackingBlocks();
   }
 
+  controlRadianceComposition(
+    control: RadianceCompositionControl,
+  ): string | undefined {
+    if (this.activeScene !== 10) return undefined;
+    return this.radianceComposition.control(control);
+  }
+
   private configurePackingMaterial(material: THREE.MeshBasicMaterial, morphPolygon: boolean): void {
     material.onBeforeCompile = (shader) => {
       shader.uniforms.uPackingIrradiance = this.packingIrradiance;
+      shader.uniforms.uPackingImage = this.packingImage;
+      shader.uniforms.uPackingImageRoll = this.packingImageRoll;
       shader.uniforms.uPackingWorldBounds = { value: AMITABHA_WORLD_BOUNDS.clone() };
+      shader.uniforms.uLegacyBlocks = this.legacyBlocksUniform;
       if (morphPolygon) shader.uniforms.uMorphTime = this.polygonMorphTime;
 
       shader.vertexShader = shader.vertexShader
@@ -695,11 +993,15 @@ export class ReactiveVisualRenderer {
           `#include <common>
           attribute vec4 aEmission;
           attribute float aOpticalKind;
+          attribute vec2 aPackingImageAnchor;
+          uniform float uPackingImageRoll;
+          uniform vec4 uPackingWorldBounds;
           varying vec2 vPackingPosition;
           varying vec2 vPackingLocal;
           varying vec4 vPackingEmission;
           varying float vPackingOpticalKind;
           varying float vPackingBoundary;
+          varying vec2 vPackingImageUv;
           ${morphPolygon
             ? `attribute float aMorphSeed;
           attribute float aMorphAmount;
@@ -735,10 +1037,32 @@ export class ReactiveVisualRenderer {
           vPackingBoundary = ${morphPolygon ? 'aPackingBoundary' : '1.0'};
           #ifdef USE_INSTANCING
             vec4 packingPosition = instanceMatrix * vec4(transformed, 1.0);
+            vec2 packingCenter = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xy;
           #else
             vec4 packingPosition = vec4(transformed, 1.0);
+            vec2 packingCenter = vec2(0.0);
           #endif
           vPackingPosition = packingPosition.xy;
+          // Project the very same full-screen image through the shape. Its
+          // anchor is frozen at birth, so Box2D motion displaces the image
+          // underneath this silhouette instead of choosing an unrelated crop.
+          float imageRollCos = cos(uPackingImageRoll);
+          float imageRollSin = sin(uPackingImageRoll);
+          vec2 screenPosition = vec2(
+            imageRollCos * packingPosition.x + imageRollSin * packingPosition.y,
+            -imageRollSin * packingPosition.x + imageRollCos * packingPosition.y
+          );
+          vec2 anchorOffset = aPackingImageAnchor - packingCenter;
+          vec2 screenAnchorOffset = vec2(
+            imageRollCos * anchorOffset.x + imageRollSin * anchorOffset.y,
+            -imageRollSin * anchorOffset.x + imageRollCos * anchorOffset.y
+          );
+          vPackingImageUv = clamp(
+            (screenPosition + screenAnchorOffset - uPackingWorldBounds.xy)
+              / (uPackingWorldBounds.zw - uPackingWorldBounds.xy),
+            vec2(0.001),
+            vec2(0.999)
+          );
           #include <project_vertex>`,
         );
 
@@ -748,11 +1072,14 @@ export class ReactiveVisualRenderer {
           `#include <common>
           varying vec2 vPackingPosition;
           varying vec2 vPackingLocal;
-          varying vec4 vPackingEmission;
-          varying float vPackingOpticalKind;
-          varying float vPackingBoundary;
-          uniform sampler2D uPackingIrradiance;
+       varying vec4 vPackingEmission;
+       varying float vPackingOpticalKind;
+       varying float vPackingBoundary;
+       varying vec2 vPackingImageUv;
+       uniform sampler2D uPackingIrradiance;
+       uniform sampler2D uPackingImage;
           uniform vec4 uPackingWorldBounds;
+          uniform float uLegacyBlocks;
 
           float packingOpticalEdge() {
             ${morphPolygon
@@ -770,6 +1097,28 @@ export class ReactiveVisualRenderer {
           }
 
           vec3 applyAmitabhaLighting(vec3 baseColour) {
+            if (uLegacyBlocks > 0.5) {
+              vec3 imageCrop = texture2D(uPackingImage, vPackingImageUv).rgb;
+              // Match the cloud's full-screen grade first. The body only
+              // reveals a displaced piece of it; it must not turn into a
+              // bright, independently coloured card.
+              vec3 imageMask = mix(
+                vec3(0.002, 0.006, 0.016),
+                imageCrop * vec3(0.34, 0.54, 0.84),
+                0.2
+              );
+              if (vPackingEmission.a > 0.001) {
+                return mix(imageMask, vPackingEmission.rgb, 0.44)
+                  * (0.86 + vPackingEmission.a * 0.42);
+              }
+              vec2 legacyUv = (vPackingPosition - uPackingWorldBounds.xy)
+                / (uPackingWorldBounds.zw - uPackingWorldBounds.xy);
+              vec3 legacyIrradiance = texture2D(
+                uPackingIrradiance,
+                clamp(legacyUv, vec2(0.001), vec2(0.999))
+              ).rgb;
+              return imageMask + legacyIrradiance * 0.14;
+            }
             if (vPackingEmission.a > 0.001) {
               return vPackingEmission.rgb * (0.92 + vPackingEmission.a * 0.34);
             }
@@ -812,7 +1161,14 @@ export class ReactiveVisualRenderer {
         .replace(
           '#include <color_fragment>',
           `#include <color_fragment>
-          if (vPackingOpticalKind > 1.5) {
+          // The HRC plane already contains the source radiance needed for
+          // transport. Letting that plane leak through the translucent source
+          // mesh made a second, low-resolution copy of the emitter visible.
+          // Emitters are therefore an opaque foreground silhouette; only the
+          // outgoing field remains visible around their exact Box2D shape.
+          if (vPackingEmission.a > 0.001) {
+            diffuseColor.a = 1.0;
+          } else if (vPackingOpticalKind > 1.5) {
             float glassFresnel = pow(
               smoothstep(0.28, 1.0, packingOpticalEdge()),
               2.2
@@ -830,8 +1186,8 @@ export class ReactiveVisualRenderer {
         );
     };
     material.customProgramCacheKey = () => morphPolygon
-      ? 'piano-forward-caustics-polygons-v2-materials'
-      : 'piano-forward-caustics-blocks-v2-materials';
+      ? 'piano-forward-caustics-polygons-v3-image-materials'
+      : 'piano-forward-caustics-blocks-v3-image-materials';
   }
 
   private disposeOutgoing(): void {
@@ -936,6 +1292,16 @@ export class ReactiveVisualRenderer {
     this.accumulationPoints.visible = false;
   }
 
+  private spawnPackingBurst(note: DetectedNote): void {
+    // A played note produces a small physical shower rather than a lone
+    // object. Stronger notes create more bodies, so the audio remains the
+    // source of density without overwhelming the Box2D/HRC body budget.
+    const strength = Math.max(0, Math.min(1, note.strength));
+    const requested = 2 + Math.floor(strength * 3);
+    const count = Math.min(requested, MAX_PACKING_BLOCKS - this.packingBlocks.length);
+    for (let index = 0; index < count; index += 1) this.spawnPackingBlock(note);
+  }
+
   private spawnPackingBlock(note: DetectedNote): void {
     this.lastPackingMidi = note.midi;
     this.packingReceivedNoteSinceTurn = true;
@@ -944,10 +1310,33 @@ export class ReactiveVisualRenderer {
     const seed = note.midi * 17.17 + note.strength * 31.7 + this.blockSequence * 7.31;
     const pitch = Math.max(0, Math.min(1, (note.midi - 21) / 87));
     const strength = Math.max(0, Math.min(1, note.strength));
-    const width = Math.max(0.3, Math.min(1.38, 1.25 - pitch * 0.8 + (pseudoRandom(seed) - 0.5) * 0.26));
-    const height = Math.max(0.18, Math.min(0.92, 0.22 + pitch * 0.56 + (pseudoRandom(seed + 19.4) - 0.5) * 0.2));
+    const blockWidth = Math.max(0.3, Math.min(1.38, 1.25 - pitch * 0.8 + (pseudoRandom(seed) - 0.5) * 0.26));
+    const blockHeight = Math.max(0.18, Math.min(0.92, 0.22 + pitch * 0.56 + (pseudoRandom(seed + 19.4) - 0.5) * 0.2));
+    // Circles belong to the original diffuse HRC mode only. The optical
+    // scenes keep their deliberate material rig unchanged.
+    const isCircle = this.legacyBlocksActive && pseudoRandom(seed + 57.9) < 0.34;
+    const circleDiameter = Math.max(0.28, Math.min(0.9, (blockWidth + blockHeight) * 0.56));
+    const width = isCircle ? circleDiameter : blockWidth;
+    const height = isCircle ? circleDiameter : blockHeight;
     const light = this.packingEmitter(seed, strength);
-    const opticalMaterial = this.selectForwardOpticalMaterial(light.emissive);
+    const legacyEmitterCount = this.packingBlocks.reduce(
+      (count, block) => count + (block.emissive ? 1 : 0),
+      0,
+    );
+    const targetEmitterCount = this.legacyEmitterCount(this.packingBlocks.length + 1);
+    // Keep a constellation of actual HRC sources alive. A loud note can add
+    // another emitter on top of the density-derived baseline.
+    const shouldEmit = this.legacyBlocksActive
+      ? legacyEmitterCount < targetEmitterCount
+        || (
+          legacyEmitterCount < LEGACY_EMITTER_MAX
+          && strength > 0.68
+          && pseudoRandom(seed + 301.7) < 0.48
+        )
+      : light.emissive;
+    const opticalMaterial = this.legacyBlocksActive
+      ? 'diffuse'
+      : this.selectForwardOpticalMaterial(light.emissive);
     const spawn = this.packingSpawn(seed, strength, height);
     const body = this.packingWorld.createDynamicBody({
       position: spawn.position,
@@ -958,27 +1347,45 @@ export class ReactiveVisualRenderer {
       angularDamping: 0.12,
       bullet: true,
     });
+    const emitterPalette = LEGACY_EMITTER_COLOURS[Math.floor(pseudoRandom(seed + 228.4) * LEGACY_EMITTER_COLOURS.length)];
+    const opaqueColour = LEGACY_OPAQUE_COLOURS[Math.floor(pseudoRandom(seed + 184.2) * LEGACY_OPAQUE_COLOURS.length)];
     const block: PackingBlock = {
-      kind: 'block',
+      kind: isCircle ? 'circle' : 'block',
       note,
       body,
+      fixture: null,
+      physicsScale: 1,
+      baseMass: 0,
       width,
       height,
-      color: opticalMaterialColour(opticalMaterial),
-      sides: 4,
+      color: this.legacyBlocksActive
+        ? (shouldEmit ? emitterPalette.body : opaqueColour)
+        : opticalMaterialColour(opticalMaterial),
+      sides: isCircle ? 32 : 4,
       morphScale: 1,
       morphAspect: 1,
       morphPhase: 0,
       morphSeed: pseudoRandom(seed + 118.2),
-      emissive: light.emissive,
-      emissionRed: light.red,
-      emissionGreen: light.green,
-      emissionBlue: light.blue,
-      emissionStrength: light.strength,
+      imageAnchorX: spawn.position.x,
+      imageAnchorY: spawn.position.y,
+      emissive: shouldEmit,
+      emissionRed: this.legacyBlocksActive && shouldEmit ? emitterPalette.emission[0] : light.red,
+      emissionGreen: this.legacyBlocksActive && shouldEmit ? emitterPalette.emission[1] : light.green,
+      emissionBlue: this.legacyBlocksActive && shouldEmit ? emitterPalette.emission[2] : light.blue,
+      emissionStrength: shouldEmit
+        ? this.legacyBlocksActive
+          ? 0.65 + strength * 0.55
+          : light.strength
+        : 0,
       opticalMaterial,
       transportOrder: this.blockSequence,
     };
-    body.createFixture(Box(width / 2, height / 2), { density: 1, friction: 0.56, restitution: 0.1 });
+    block.fixture = body.createFixture(isCircle ? Circle(width / 2) : Box(width / 2, height / 2), {
+      density: isCircle ? 0.86 : 1,
+      friction: isCircle ? 0.44 : 0.56,
+      restitution: isCircle ? 0.28 : 0.1,
+    });
+    block.baseMass = body.getMass();
     body.setUserData(block);
     this.packingBlocks.push(block);
   }
@@ -1017,6 +1424,9 @@ export class ReactiveVisualRenderer {
       kind: 'polygon',
       note,
       body,
+      fixture: null,
+      physicsScale: 1,
+      baseMass: 0,
       width,
       height,
       color: opticalMaterialColour(opticalMaterial),
@@ -1025,6 +1435,8 @@ export class ReactiveVisualRenderer {
       morphAspect: 1,
       morphPhase: pseudoRandom(seed + 71.3) * Math.PI * 2,
       morphSeed: pseudoRandom(seed + 118.2),
+      imageAnchorX: spawn.position.x,
+      imageAnchorY: spawn.position.y,
       emissive: light.emissive,
       emissionRed: light.red,
       emissionGreen: light.green,
@@ -1033,11 +1445,104 @@ export class ReactiveVisualRenderer {
       opticalMaterial,
       transportOrder: this.blockSequence,
     };
-    body.createFixture(Polygon(vertices), {
+    block.fixture = body.createFixture(Polygon(vertices), {
       density: 0.8 + strength * 0.8 + density * 0.65,
       friction: 0.42 + (1 - turbulence) * 0.28,
       restitution: 0.08 + turbulence * 0.2,
     });
+    block.baseMass = body.getMass();
+    body.setUserData(block);
+    this.packingBlocks.push(block);
+  }
+
+  private seedDynamicOpticalScene(): void {
+    // These are ordinary Box2D bodies, not a separate demo animation. They
+    // begin in a legible emitter → optic arrangement, drift/collide slowly,
+    // while note-triggered blocks retain the full free Box2D behaviour.
+    this.packingWorld.setGravity(Vec2(0, -3.8));
+    const seed: Array<{
+      x: number; y: number; angle: number; vx: number; vy: number; spin: number;
+      width: number; height: number; material: DynamicOpticalMaterial; color: number;
+      strength?: number; gravityScale: number;
+    }> = [
+      { x: -3.9, y: 2.05, angle: 0.08, vx: 0.34, vy: -0.03, spin: 0.18, width: 0.55, height: 0.55, material: 'emitter', color: 0xffe8a3, strength: 4.1, gravityScale: 0 },
+      { x: 3.55, y: 2.5, angle: -0.32, vx: -0.30, vy: -0.02, spin: -0.15, width: 0.48, height: 0.48, material: 'emitter', color: 0xa8dcff, strength: 3.5, gravityScale: 0 },
+      { x: -1.92, y: 1.3, angle: 0.78, vx: 0.08, vy: 0.0, spin: 0.10, width: 0.24, height: 1.75, material: 'mirror', color: 0xd7e8ff, gravityScale: 0 },
+      { x: 0.05, y: 1.42, angle: -0.32, vx: -0.08, vy: 0.0, spin: -0.08, width: 0.78, height: 1.28, material: 'glass', color: 0x35dcff, gravityScale: 0 },
+      { x: 2.1, y: 0.54, angle: 1.06, vx: -0.06, vy: -0.04, spin: 0.08, width: 0.2, height: 1.52, material: 'mirror', color: 0xc5d6f1, gravityScale: 0 },
+      { x: -2.85, y: -0.38, angle: -0.17, vx: 0.17, vy: 0.0, spin: -0.08, width: 1.04, height: 0.45, material: 'metal', color: 0xc77b32, gravityScale: 0 },
+      { x: 1.18, y: -0.55, angle: 0.35, vx: -0.12, vy: 0.0, spin: 0.12, width: 0.82, height: 0.42, material: 'glass', color: 0x52cde6, gravityScale: 0 },
+      { x: 3.45, y: -1.05, angle: -0.24, vx: -0.16, vy: 0.0, spin: -0.08, width: 0.7, height: 0.54, material: 'diffuse', color: 0x6f7888, gravityScale: 0 },
+      { x: -0.35, y: -1.65, angle: 0.11, vx: 0.05, vy: 0.0, spin: 0.06, width: 1.05, height: 0.34, material: 'diffuse', color: 0x7d8795, gravityScale: 0 },
+    ];
+    seed.forEach((spec, index) => this.createDynamicOpticalBlock(spec, index));
+    this.dynamicOpticalField.setBodies(this.buildDynamicOpticalBodies());
+  }
+
+  private createDynamicOpticalBlock(
+    spec: {
+      x: number; y: number; angle: number; vx: number; vy: number; spin: number;
+      width: number; height: number; material: DynamicOpticalMaterial; color: number;
+      strength?: number; gravityScale: number;
+    },
+    index: number,
+  ): void {
+    this.blockSequence += 1;
+    const note: DetectedNote = {
+      midi: 48 + index * 5,
+      frequency: 440 * 2 ** ((48 + index * 5 - 69) / 12),
+      strength: 0.78,
+    };
+    const body = this.packingWorld.createDynamicBody({
+      position: Vec2(spec.x, spec.y),
+      angle: spec.angle,
+      linearVelocity: Vec2(spec.vx, spec.vy),
+      angularVelocity: spec.spin,
+      gravityScale: spec.gravityScale,
+      linearDamping: 0.32,
+      angularDamping: 0.38,
+      bullet: true,
+    });
+    const colour = new THREE.Color(spec.color);
+    const isEmitter = spec.material === 'emitter';
+    const opticalMaterial: Exclude<ForwardOpticalMaterial, 'emitter'> = spec.material === 'glass'
+      ? 'glass'
+      : spec.material === 'mirror' || spec.material === 'metal'
+        ? 'mirror'
+        : 'diffuse';
+    const block: PackingBlock = {
+      kind: 'block',
+      note,
+      body,
+      fixture: null,
+      physicsScale: 1,
+      baseMass: 0,
+      width: spec.width,
+      height: spec.height,
+      color: spec.color,
+      sides: 4,
+      morphScale: 1,
+      morphAspect: 1,
+      morphPhase: 0,
+      morphSeed: pseudoRandom(this.blockSequence * 7.17),
+      imageAnchorX: spec.x,
+      imageAnchorY: spec.y,
+      emissive: isEmitter,
+      emissionRed: isEmitter ? colour.r : 0,
+      emissionGreen: isEmitter ? colour.g : 0,
+      emissionBlue: isEmitter ? colour.b : 0,
+      emissionStrength: isEmitter ? spec.strength ?? 3.2 : 0,
+      opticalMaterial,
+      dynamicMaterial: spec.material,
+      dynamicPinned: true,
+      transportOrder: this.blockSequence,
+    };
+    block.fixture = body.createFixture(Box(spec.width * 0.5, spec.height * 0.5), {
+      density: isEmitter ? 0.72 : spec.material === 'glass' ? 0.9 : 1.1,
+      friction: 0.54,
+      restitution: 0.12,
+    });
+    block.baseMass = body.getMass();
     body.setUserData(block);
     this.packingBlocks.push(block);
   }
@@ -1100,29 +1605,35 @@ export class ReactiveVisualRenderer {
   }
 
   private updatePackingBlocks(dt: number, elapsed: number): void {
-    if (this.impulseMode !== 3 && this.impulseMode !== 5) return;
+    if (
+      this.activeScene === 8
+      || this.activeScene === 9
+      || this.activeScene === 10
+    ) return;
+    const dynamicOptics = this.activeScene === 7;
+    if (!dynamicOptics && this.impulseMode !== 3 && this.impulseMode !== 5) return;
     const frameDt = Math.min(dt, 0.1);
     this.polygonMorphTime.value = elapsed;
     this.packingDensity = damp(this.packingDensity, this.packingDensityTarget, 3.2, frameDt);
     this.packingTurbulence = damp(this.packingTurbulence, this.packingTurbulenceTarget, 2.8, frameDt);
     this.packingTension = damp(this.packingTension, this.packingTensionTarget, 3.6, frameDt);
 
-    if (this.impulseMode === 3) {
-      this.packingCycleElapsed += frameDt;
-      if (!this.packingTurnActive && this.packingCycleElapsed >= PACKING_ROTATION_INTERVAL) {
-        this.beginPackingTurn();
-      }
-    } else {
+    if (dynamicOptics || this.impulseMode !== 3) {
       this.packingCycleElapsed = 0;
     }
 
-    if (this.packingTurnActive) {
+    if (!dynamicOptics && this.packingTurnActive) {
       this.packingTurnElapsed += frameDt;
       const progress = Math.min(1, this.packingTurnElapsed / PACKING_ROTATION_DURATION);
       const eased = progress * progress * (3 - 2 * progress);
       this.packingCameraRotation = this.packingTurnStartRotation + this.packingTurnAngle * eased;
       this.camera.rotation.z = this.packingCameraRotation;
       if (progress >= 1) this.commitPackingTurn();
+    }
+
+    if (!dynamicOptics) {
+      this.updateLegacyEmitterScale();
+      this.syncLegacyEmitterPhysics();
     }
 
     // A camera-only turn must never pause the physical scene. Keep the fixed
@@ -1142,17 +1653,30 @@ export class ReactiveVisualRenderer {
     this.packingBlocks.forEach((block) => {
       if (block.kind === 'polygon') this.updatePackingMorph(block, frameDt);
     });
+    if (dynamicOptics) {
+      this.dynamicOpticalField.setBodies(this.buildDynamicOpticalBodies());
+      return;
+    }
+    this.updateLegacyBlockMaterials(frameDt);
     this.updateAmitabhaField(elapsed);
-    this.forwardCaustics.update(frameDt, this.buildForwardOpticalBodies());
+    if (!this.legacyBlocksActive) this.forwardCaustics.update(frameDt, this.buildForwardOpticalBodies());
     let blockInstance = 0;
+    let circleInstance = 0;
     const polygonCounts = [0, 0, 0, 0, 0, 0];
     for (let index = 0; index < this.packingBlocks.length; index += 1) {
       const block = this.packingBlocks[index];
       const position = block.body.getPosition();
       this.blockPosition.set(position.x, position.y, 0);
       this.blockQuaternion.setFromAxisAngle(this.blockRotationAxis, block.body.getAngle());
+      const emitterScale = this.legacyBlocksActive && block.emissive
+        ? this.legacyEmitterScale
+        : 1;
       if (block.kind === 'block') {
-        this.blockMatrix.compose(this.blockPosition, this.blockQuaternion, this.blockScale.set(block.width, block.height, 1));
+        this.blockMatrix.compose(
+          this.blockPosition,
+          this.blockQuaternion,
+          this.blockScale.set(block.width * emitterScale, block.height * emitterScale, 1),
+        );
         this.blockMesh.setMatrixAt(blockInstance, this.blockMatrix);
         this.blockMesh.setColorAt(blockInstance, this.blockColor.setHex(block.color));
         this.blockEmissionData[blockInstance * 4] = block.emissionRed;
@@ -1160,7 +1684,25 @@ export class ReactiveVisualRenderer {
         this.blockEmissionData[blockInstance * 4 + 2] = block.emissionBlue;
         this.blockEmissionData[blockInstance * 4 + 3] = block.emissionStrength;
         this.blockOpticalData[blockInstance] = opticalMaterialCode(block.opticalMaterial);
+        this.blockImageAnchorData[blockInstance * 2] = block.imageAnchorX;
+        this.blockImageAnchorData[blockInstance * 2 + 1] = block.imageAnchorY;
         blockInstance += 1;
+      } else if (block.kind === 'circle') {
+        this.blockMatrix.compose(
+          this.blockPosition,
+          this.blockQuaternion,
+          this.blockScale.set(block.width * emitterScale, block.height * emitterScale, 1),
+        );
+        this.circleMesh.setMatrixAt(circleInstance, this.blockMatrix);
+        this.circleMesh.setColorAt(circleInstance, this.blockColor.setHex(block.color));
+        this.circleEmissionData[circleInstance * 4] = block.emissionRed;
+        this.circleEmissionData[circleInstance * 4 + 1] = block.emissionGreen;
+        this.circleEmissionData[circleInstance * 4 + 2] = block.emissionBlue;
+        this.circleEmissionData[circleInstance * 4 + 3] = block.emissionStrength;
+        this.circleOpticalData[circleInstance] = 0;
+        this.circleImageAnchorData[circleInstance * 2] = block.imageAnchorX;
+        this.circleImageAnchorData[circleInstance * 2 + 1] = block.imageAnchorY;
+        circleInstance += 1;
       } else {
         const meshIndex = block.sides - 3;
         const instanceIndex = polygonCounts[meshIndex];
@@ -1181,6 +1723,8 @@ export class ReactiveVisualRenderer {
         this.polygonEmissionData[meshIndex][instanceIndex * 4 + 2] = block.emissionBlue;
         this.polygonEmissionData[meshIndex][instanceIndex * 4 + 3] = block.emissionStrength;
         this.polygonOpticalData[meshIndex][instanceIndex] = opticalMaterialCode(block.opticalMaterial);
+        this.polygonImageAnchorData[meshIndex][instanceIndex * 2] = block.imageAnchorX;
+        this.polygonImageAnchorData[meshIndex][instanceIndex * 2 + 1] = block.imageAnchorY;
         polygonCounts[meshIndex] += 1;
       }
     }
@@ -1189,7 +1733,15 @@ export class ReactiveVisualRenderer {
     if (this.blockMesh.instanceColor) this.blockMesh.instanceColor.needsUpdate = true;
     this.blockGeometry.getAttribute('aEmission').needsUpdate = true;
     this.blockGeometry.getAttribute('aOpticalKind').needsUpdate = true;
+    this.blockGeometry.getAttribute('aPackingImageAnchor').needsUpdate = true;
     this.blockMesh.visible = blockInstance > 0;
+    this.circleMesh.count = circleInstance;
+    this.circleMesh.instanceMatrix.needsUpdate = true;
+    if (this.circleMesh.instanceColor) this.circleMesh.instanceColor.needsUpdate = true;
+    this.circleGeometry.getAttribute('aEmission').needsUpdate = true;
+    this.circleGeometry.getAttribute('aOpticalKind').needsUpdate = true;
+    this.circleGeometry.getAttribute('aPackingImageAnchor').needsUpdate = true;
+    this.circleMesh.visible = circleInstance > 0;
     this.polygonMeshes.forEach((mesh, index) => {
       mesh.count = polygonCounts[index];
       mesh.instanceMatrix.needsUpdate = true;
@@ -1198,6 +1750,7 @@ export class ReactiveVisualRenderer {
       this.polygonGeometries[index].getAttribute('aMorphAmount').needsUpdate = true;
       this.polygonGeometries[index].getAttribute('aEmission').needsUpdate = true;
       this.polygonGeometries[index].getAttribute('aOpticalKind').needsUpdate = true;
+      this.polygonGeometries[index].getAttribute('aPackingImageAnchor').needsUpdate = true;
       mesh.visible = polygonCounts[index] > 0;
     });
   }
@@ -1215,6 +1768,111 @@ export class ReactiveVisualRenderer {
     const spinDirection = block.morphSeed >= 0.5 ? 1 : -1;
     const targetSpin = spinDirection * (0.35 + chaos * 5.8) * (0.65 + block.note.strength * 0.55);
     block.body.setAngularVelocity(damp(block.body.getAngularVelocity(), targetSpin, 0.16 + chaos * 0.55, dt));
+  }
+
+  private updateLegacyBlockMaterials(dt: number): void {
+    if (!this.legacyBlocksActive) {
+      this.legacyMaterialCycleElapsed = 0;
+      return;
+    }
+    if (this.packingBlocks.length === 0) return;
+    this.legacyMaterialCycleElapsed += dt;
+    if (this.legacyMaterialCycleElapsed < LEGACY_MATERIAL_CYCLE_SECONDS) return;
+    this.legacyMaterialCycleElapsed -= LEGACY_MATERIAL_CYCLE_SECONDS;
+    this.legacyMaterialCycle += 1;
+
+    const ordered = [...this.packingBlocks].sort((left, right) => left.transportOrder - right.transportOrder);
+    const emitterCount = this.legacyEmitterCount(ordered.length);
+    const selected = new Set(
+      [...ordered]
+        .sort((left, right) => (
+          pseudoRandom(left.transportOrder * 5.3 + this.legacyMaterialCycle * 11.7)
+          - pseudoRandom(right.transportOrder * 5.3 + this.legacyMaterialCycle * 11.7)
+        ))
+        .slice(0, emitterCount),
+    );
+
+    // Rotate a group of real emitters, not a single coloured body. The
+    // hand-off changes the shadows and the cloud-mask illumination together.
+    ordered.forEach((block) => {
+      if (selected.has(block)) this.makeLegacyBlockEmitter(block);
+      else this.makeLegacyBlockOpaque(block);
+    });
+  }
+
+  private legacyEmitterCount(bodyCount: number): number {
+    if (!this.legacyBlocksActive) return 0;
+    return Math.min(
+      LEGACY_EMITTER_MAX,
+      Math.max(LEGACY_EMITTER_MIN, Math.ceil(bodyCount * 0.34)),
+    );
+  }
+
+  private updateLegacyEmitterScale(): void {
+    if (!this.legacyBlocksActive || !Number.isFinite(this.legacyEmitterScaleStartedAt)) return;
+    const progress = Math.min(
+      1,
+      Math.max(
+        0,
+        (Date.now() / 1000 - this.legacyEmitterScaleStartedAt)
+          / LEGACY_EMITTER_SCALE_DURATION,
+      ),
+    );
+    const eased = progress * progress * (3 - 2 * progress);
+    this.legacyEmitterScale = this.legacyEmitterScaleStart
+      + (this.legacyEmitterScaleTarget - this.legacyEmitterScaleStart) * eased;
+    if (progress >= 1) this.legacyEmitterScaleStartedAt = -Infinity;
+  }
+
+  private syncLegacyEmitterPhysics(): void {
+    if (!this.legacyBlocksActive) return;
+    for (const block of this.packingBlocks) {
+      if (block.kind === 'polygon') continue;
+      const targetScale = block.emissive ? this.legacyEmitterScale : 1;
+      const scaleDelta = Math.abs(targetScale - block.physicsScale);
+      const atEndpoint = Math.abs(targetScale - LEGACY_EMITTER_SCALE_MIN) < 0.0001
+        || Math.abs(targetScale - LEGACY_EMITTER_SCALE_MAX) < 0.0001;
+      if (
+        block.fixture
+        && scaleDelta < LEGACY_PHYSICS_SCALE_STEP
+        && (!atEndpoint || scaleDelta < 0.0001)
+      ) {
+        continue;
+      }
+
+      if (block.fixture) block.body.destroyFixture(block.fixture);
+      const shape = block.kind === 'circle'
+        ? Circle(block.width * targetScale * 0.5)
+        : Box(block.width * targetScale * 0.5, block.height * targetScale * 0.5);
+      block.fixture = block.body.createFixture(shape, {
+        density: block.kind === 'circle' ? 0.86 : 1,
+        friction: block.kind === 'circle' ? 0.44 : 0.56,
+        restitution: block.kind === 'circle' ? 0.28 : 0.1,
+      });
+      block.physicsScale = targetScale;
+      block.body.setAwake(true);
+    }
+  }
+
+  private makeLegacyBlockOpaque(block: PackingBlock): void {
+    const index = Math.floor(pseudoRandom(block.transportOrder * 3.7 + this.legacyMaterialCycle * 9.1) * LEGACY_OPAQUE_COLOURS.length);
+    block.emissive = false;
+    block.emissionRed = 0;
+    block.emissionGreen = 0;
+    block.emissionBlue = 0;
+    block.emissionStrength = 0;
+    block.color = LEGACY_OPAQUE_COLOURS[index];
+  }
+
+  private makeLegacyBlockEmitter(block: PackingBlock): void {
+    const index = Math.floor(pseudoRandom(block.transportOrder * 5.3 + this.legacyMaterialCycle * 11.7) * LEGACY_EMITTER_COLOURS.length);
+    const palette = LEGACY_EMITTER_COLOURS[index];
+    block.emissive = true;
+    block.emissionRed = palette.emission[0];
+    block.emissionGreen = palette.emission[1];
+    block.emissionBlue = palette.emission[2];
+    block.emissionStrength = 0.65 + block.note.strength * 0.55;
+    block.color = palette.body;
   }
 
   private updateAmitabhaField(elapsed: number): void {
@@ -1235,11 +1893,14 @@ export class ReactiveVisualRenderer {
         const morphHeight = block.kind === 'polygon'
           ? block.height * block.morphScale * block.morphAspect
           : block.height;
+        const emitterScale = this.legacyBlocksActive && block.emissive
+          ? this.legacyEmitterScale
+          : 1;
         return {
           x: position.x,
           y: position.y,
-          halfWidth: morphWidth * 0.5,
-          halfHeight: morphHeight * 0.5,
+          halfWidth: morphWidth * emitterScale * 0.5,
+          halfHeight: morphHeight * emitterScale * 0.5,
           angle: block.body.getAngle(),
           emission: [block.emissionRed, block.emissionGreen, block.emissionBlue] as const,
           emissionStrength: block.emissionStrength * pulse,
@@ -1250,7 +1911,7 @@ export class ReactiveVisualRenderer {
                 this.blockColor.g * 0.72,
                 this.blockColor.b * 0.72,
               ] as const,
-          sides: block.kind === 'polygon' ? block.sides : undefined,
+          sides: block.kind === 'polygon' || block.kind === 'circle' ? block.sides : undefined,
           transportRole: 'body',
           transportOrder: block.transportOrder,
         };
@@ -1270,6 +1931,45 @@ export class ReactiveVisualRenderer {
     this.amitabhaField.setBodies(bodies);
     this.amitabhaField.render();
     this.packingIrradiance.value = this.amitabhaField.texture;
+  }
+
+  private buildDynamicOpticalBodies(): DynamicOpticalBody[] {
+    const blocks = this.packingBlocks.map((block): DynamicOpticalBody => {
+      const position = block.body.getPosition();
+      const material: DynamicOpticalMaterial = block.dynamicMaterial
+        ?? (block.emissive
+          ? 'emitter'
+          : block.opticalMaterial === 'glass'
+            ? 'glass'
+            : block.opticalMaterial === 'mirror'
+              ? (block.transportOrder % 5 === 0 ? 'metal' : 'mirror')
+              : 'diffuse');
+      return {
+        x: position.x,
+        y: position.y,
+        width: block.width * (block.kind === 'polygon' ? block.morphScale : 1),
+        height: block.height * (block.kind === 'polygon' ? block.morphScale * block.morphAspect : 1),
+        angle: block.body.getAngle(),
+        material,
+        color: block.color,
+        emissionStrength: block.emissionStrength,
+        order: block.transportOrder,
+        pinned: block.dynamicPinned,
+      };
+    });
+    blocks.push({
+      x: 0,
+      y: this.packingFloorY - 0.08,
+      width: PACKING_FLOOR_HALF_WIDTH * 2,
+      height: 0.16,
+      angle: 0,
+      material: 'diffuse',
+      color: 0x4e5562,
+      emissionStrength: 0,
+      order: -1,
+      pinned: true,
+    });
+    return blocks;
   }
 
   private buildForwardOpticalBodies(): ForwardOpticalBody[] {
@@ -1490,6 +2190,12 @@ export class ReactiveVisualRenderer {
     this.packingIdleDirection = 1;
     this.packingReceivedNoteSinceTurn = false;
     this.lastPackingMidi = 60;
+    this.legacyMaterialCycleElapsed = 0;
+    this.legacyMaterialCycle = 0;
+    this.legacyEmitterScale = LEGACY_EMITTER_SCALE_MIN;
+    this.legacyEmitterScaleStart = LEGACY_EMITTER_SCALE_MIN;
+    this.legacyEmitterScaleTarget = LEGACY_EMITTER_SCALE_MIN;
+    this.legacyEmitterScaleStartedAt = -Infinity;
     this.packingGravityEnabled = true;
     this.packingWorld.setGravity(Vec2(0, -14));
     this.blockFrameMaterial.opacity = 0.55;
@@ -1519,10 +2225,13 @@ export class ReactiveVisualRenderer {
     this.modeFiveCameraAmount = 0;
     this.blockMesh.count = 0;
     this.blockMesh.visible = false;
+    this.circleMesh.count = 0;
+    this.circleMesh.visible = false;
     this.polygonMeshes.forEach((mesh) => {
       mesh.count = 0;
       mesh.visible = false;
     });
+    this.dynamicOpticalField.setBodies([]);
   }
 
   private updateVoronoi(dt: number, elapsed: number): void {
@@ -1640,7 +2349,8 @@ export class ReactiveVisualRenderer {
     return pool[Math.min(pool.length - 1, Math.floor(random * pool.length))].index;
   }
 
-  private togglePackingGravity(): void {
+  togglePackingGravity(): boolean | undefined {
+    if (!this.legacyBlocksActive && this.activeScene !== 7 && this.impulseMode !== 5) return undefined;
     this.packingGravityEnabled = !this.packingGravityEnabled;
     this.packingWorld.setGravity(Vec2(0, this.packingGravityEnabled ? -14 : 0));
     this.blockFrameMaterial.opacity = this.packingGravityEnabled ? 0.55 : 0.18;
@@ -1648,6 +2358,23 @@ export class ReactiveVisualRenderer {
       block.body.setAwake(true);
       if (!this.packingGravityEnabled) this.launchPackingBodyTowardCenter(block, index);
     });
+    return this.packingGravityEnabled;
+  }
+
+  rotatePackingScene(): boolean {
+    if (!this.legacyBlocksActive || this.packingTurnActive) return false;
+    this.beginPackingTurn();
+    return true;
+  }
+
+  toggleLitBlockScale(): 1 | 3 | undefined {
+    if (!this.legacyBlocksActive || !this.packingBlocks.some((block) => block.emissive)) return undefined;
+    this.legacyEmitterScaleStart = this.legacyEmitterScale;
+    this.legacyEmitterScaleTarget = this.legacyEmitterScaleTarget === LEGACY_EMITTER_SCALE_MAX
+      ? LEGACY_EMITTER_SCALE_MIN
+      : LEGACY_EMITTER_SCALE_MAX;
+    this.legacyEmitterScaleStartedAt = Date.now() / 1000;
+    return this.legacyEmitterScaleTarget;
   }
 
   private launchPackingBodyTowardCenter(block: PackingBlock, index: number): void {
@@ -1671,7 +2398,6 @@ export class ReactiveVisualRenderer {
   }
 
   private beginPackingTurn(): void {
-    this.packingCycleElapsed -= PACKING_ROTATION_INTERVAL;
     this.packingTurnActive = true;
     this.packingTurnElapsed = 0;
     this.packingTurnDirection = this.packingReceivedNoteSinceTurn
@@ -1706,6 +2432,7 @@ export class ReactiveVisualRenderer {
 
   private syncAmitabhaDisplayToCamera(): void {
     const roll = this.camera.rotation.z;
+    this.packingImageRoll.value = roll;
     const centerX = (AMITABHA_WORLD_BOUNDS.x + AMITABHA_WORLD_BOUNDS.z) * 0.5;
     const centerY = (AMITABHA_WORLD_BOUNDS.y + AMITABHA_WORLD_BOUNDS.w) * 0.5;
     const cosine = Math.cos(roll);
@@ -1714,7 +2441,7 @@ export class ReactiveVisualRenderer {
     this.amitabhaDisplay.position.set(
       cosine * centerX - sine * centerY,
       sine * centerX + cosine * centerY,
-      -0.22,
+      AMITABHA_DISPLAY_Z,
     );
     this.amitabhaField.setDisplayRoll(roll);
   }
@@ -1740,7 +2467,7 @@ export class ReactiveVisualRenderer {
     const kind = typeof value === 'object' && value !== null && 'kind' in value
       ? (value as { kind?: unknown }).kind
       : null;
-    return kind === 'block' || kind === 'polygon'
+    return kind === 'block' || kind === 'circle' || kind === 'polygon'
       ? value as PackingBlock
       : null;
   }
@@ -1756,13 +2483,17 @@ export class ReactiveVisualRenderer {
   }
 
   private onEvent(event: GestureEvent): void {
-    if (this.impulseMode === 4) return;
+    if (this.impulseMode === 4 && this.activeScene !== 8) return;
     if (event.type === 'estalla' || event.type === 'climax' || event.target === 'explosion' || event.target === 'finale') {
       const intensity = 'intensity' in event && typeof event.intensity === 'number' ? event.intensity : 1;
       this.flash = Math.max(this.flash, intensity);
       this.pulse = Math.max(this.pulse, 0.75);
+      this.viscoelasticFluid.burst(intensity);
     }
-    if (event.type === 'pulso') this.pulse = Math.max(this.pulse, 0.7);
+    if (event.type === 'pulso') {
+      this.pulse = Math.max(this.pulse, 0.7);
+      this.viscoelasticFluid.burst(0.42);
+    }
   }
 
   private onContextLost = (event: Event): void => {
@@ -1779,7 +2510,9 @@ export class ReactiveVisualRenderer {
   private applyQuality(): void {
     // High mode supersamples modestly even on a 1× display. MSAA handles
     // triangle coverage while the shader resolves translucent silhouettes.
-    this.renderer.setPixelRatio(this.quality === 'safe' ? 0.65 : 1.2);
+    const pixelRatio = this.quality === 'safe' ? 0.65 : 1.2;
+    this.renderer.setPixelRatio(pixelRatio);
+    this.viscoelasticFluid.setPixelRatio(pixelRatio);
   }
 
   private updateTransportQuality(dt: number): void {
@@ -1795,7 +2528,12 @@ export class ReactiveVisualRenderer {
       this.hrcP95SampleElapsed = 0;
     }
     this.updateForwardCausticsQuality(dt);
-    if (this.impulseMode !== 3 && this.impulseMode !== 5) return;
+    if (
+      this.activeScene !== 9
+      && this.activeScene !== 10
+      && this.impulseMode !== 3
+      && this.impulseMode !== 5
+    ) return;
     if (document.visibilityState !== 'visible') {
       this.hrcSlowElapsed = 0;
       this.hrcStableElapsed = 0;
@@ -1808,6 +2546,20 @@ export class ReactiveVisualRenderer {
         this.hrcQuality = 'safe';
         this.amitabhaField.setQuality('safe');
       }
+      return;
+    }
+
+    // Scene 9 uses a 1024² particle transport mask and an edge-aware display
+    // resolve specifically to preserve small emitters and their shadow edges.
+    // Letting a transient entrance/compile spike demote HRC to 256² defeats
+    // that detail even after the renderer has returned to 120 FPS.
+    if (this.activeScene === 9) {
+      if (this.hrcQuality !== 'high') {
+        this.hrcQuality = 'high';
+        this.amitabhaField.setQuality('high');
+      }
+      this.hrcSlowElapsed = 0;
+      this.hrcStableElapsed = 0;
       return;
     }
 
@@ -1835,6 +2587,36 @@ export class ReactiveVisualRenderer {
   }
 
   private updateForwardCausticsQuality(dt: number): void {
+    if (this.legacyBlocksActive) {
+      this.causticsSlowElapsed = 0;
+      this.causticsStableElapsed = 0;
+      this.setForwardCausticsQuality('off');
+      return;
+    }
+    if (
+      this.activeScene === 8
+      || this.activeScene === 9
+      || this.activeScene === 10
+    ) {
+      this.setForwardCausticsQuality('off');
+      return;
+    }
+    if (this.activeScene === 6 || this.activeScene === 7) {
+      this.setForwardCausticsQuality('off');
+      const p95 = this.hrcFrameTimeP95Ms;
+      if (this.activeScene === 6) {
+        if (this.quality === 'safe' || p95 > 18) {
+          this.opticalLab.setQuality('safe');
+        } else if (p95 > 0 && p95 < 13) {
+          this.opticalLab.setQuality('high');
+        }
+      } else if (this.quality === 'safe' || p95 > 18) {
+        this.dynamicOpticalField.setQuality('safe');
+      } else if (p95 > 0 && p95 < 13) {
+        this.dynamicOpticalField.setQuality('high');
+      }
+      return;
+    }
     const packingActive = this.impulseMode === 3 || this.impulseMode === 5;
     if (!packingActive || document.visibilityState !== 'visible') {
       this.causticsSlowElapsed = 0;
@@ -1900,6 +2682,8 @@ export class ReactiveVisualRenderer {
     const width = canvas.clientWidth || window.innerWidth;
     const height = canvas.clientHeight || window.innerHeight;
     this.renderer.setSize(width, height, false);
+    this.opticalLab.setSize(width, height);
+    this.dynamicOpticalField.setSize(width, height);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     const margin = Math.max(24, Math.min(58, Math.min(width, height) * 0.065));

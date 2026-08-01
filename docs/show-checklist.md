@@ -15,8 +15,10 @@
 
 ## Durante el show
 
-- Usar `1`–`6` para escenas, espacio para estallido, `B` para blackout y `P`
-  para el panel embebido.
+- Usar `1`–`9` y `0` para las diez escenas, espacio para estallido, `B` para
+  blackout y `P` para el panel embebido.
+- En `10 · Órbita de Penumbra`, ensayar `A/S/D/F/G` como instrumento manual:
+  apariencia, escala, desplazamiento, foco luminoso y gama de color.
 - Si la respuesta musical es inestable, congelar el gesto afectado y usar
   overrides antes de recalibrar.
 - Si WEBGL o el micrófono indican error, aplicar el procedimiento de

@@ -1,5 +1,6 @@
 import './style.css';
 import { LiveAudioAnalyzer } from './audio/analyzer';
+import { silentMusicAnalysis, summarizeMusicAnalysis } from './audio/music-analysis';
 import { PolyphonicNoteTranscriber } from './audio/polyphonic-transcriber';
 import { WideChordSwitchDetector } from './audio/wide-chord-switch';
 import { ControlBus, type ControlAction } from './control/bus';
@@ -26,15 +27,40 @@ if (panelOnly) {
   const { ReactiveVisualRenderer } = await import('./visual/renderer');
   const loadedConfig = loadShowConfig(localStorage);
   app.innerHTML = `
-    <main class="stage"><canvas id="visual-canvas" aria-label="Visual reactivo del piano"></canvas><div class="stage-label">PIANO / UMBRAL</div></main>
+    <main class="stage">
+      <canvas id="visual-canvas" aria-label="Visual reactivo del piano"></canvas>
+      <div class="optical-lab-legend" hidden>
+        <strong>ESCENA 6 · OPTICAL LAB</strong>
+        <span><i class="emitter"></i>EMISOR</span>
+        <span><i class="mirror"></i>ESPEJO</span>
+        <span><i class="metal"></i>METAL RUGOSO</span>
+        <span><i class="glass"></i>VIDRIO / LENTE · IOR 1.52</span>
+        <span><i class="diffuse"></i>DIFUSO / RECEPTOR</span>
+        <small>Objetos fijos · acumulación temporal GPU</small>
+      </div>
+      <div class="optical-lab-legend dynamic-optical-legend" hidden>
+        <strong>ESCENA 7 · ÓPTICA CINÉTICA</strong>
+        <span><i class="emitter"></i>EMISOR</span>
+        <span><i class="mirror"></i>ESPEJO</span>
+        <span><i class="metal"></i>METAL RUGOSO</span>
+        <span><i class="glass"></i>VIDRIO · SNELL / FRESNEL</span>
+        <span><i class="diffuse"></i>DIFUSO</span>
+        <small>Box2D vivo · rayos directos GPU · sin acumulación aleatoria</small>
+      </div>
+      <div class="stage-label">PIANO / UMBRAL</div>
+    </main>
     <aside id="director-panel"></aside>
   `;
   const canvas = document.querySelector<HTMLCanvasElement>('#visual-canvas')!;
   const stage = document.querySelector<HTMLElement>('.stage')!;
   const stageLabel = document.querySelector<HTMLElement>('.stage-label')!;
+  const opticalLabLegend = document.querySelector<HTMLElement>('.optical-lab-legend')!;
+  const dynamicOpticalLegend = document.querySelector<HTMLElement>('.dynamic-optical-legend')!;
   let notice: string | null = loadedConfig.warning
     ?? (loadedConfig.migrated ? 'Se migró el preset local al formato actual.' : null)
-    ?? (!window.isSecureContext ? 'El micrófono requiere localhost o HTTPS; este origen no es seguro.' : null);
+    ?? (!window.isSecureContext
+      ? 'El micrófono requiere HTTPS o localhost. Abrí http://localhost:5174/ en esta misma máquina.'
+      : null);
   let connectionNotice: string | null = null;
   let renderer: RendererInstance | null = null;
   let rendererStatus: RendererStatus = {
@@ -42,7 +68,18 @@ if (panelOnly) {
     drawCalls: 0, geometries: 0, textures: 0, contextLosses: 0,
     fpsAverage: 0, frameTimeP95Ms: 0, tabVisible: document.visibilityState === 'visible',
     voronoiCells: 5, packingGravityEnabled: true,
-    hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 2, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
+    packingCameraRotationDegrees: 0, packingEmitterScale: 1, packingEmitterScaleTarget: 1,
+    packingEmitterPhysicsScale: 1, packingEmitterMassScale: 1,
+    fluidActive: false, fluidParticleCount: 0, fluidSpringCount: 0,
+    radianceCompositionActive: false,
+    radianceCompositionForm: '—',
+    radianceCompositionScale: 1,
+    radianceCompositionScaleTarget: 1,
+    radianceCompositionLayout: '—',
+    radianceCompositionFocus: '—',
+    radianceCompositionPalette: '—',
+    radianceCompositionEmitterCount: 0,
+    hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 4, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
     causticsActive: false, causticsQuality: 'high', causticsEmitterCount: 0,
     causticsMaterialCount: 0, causticsRayCount: 0, causticsHitCount: 0,
     causticsPointCount: 0, causticsUpdateHz: 0, causticsCpuTimeMs: 0,
@@ -63,6 +100,7 @@ if (panelOnly) {
   let revision = 0;
   let fps = 0;
   let lastOutputs: SystemStatus['outputs'] = {};
+  let musicAnalysis = silentMusicAnalysis();
   let lastRender = performance.now();
   let lastFpsAt = lastRender;
   let renderedFrames = 0;
@@ -94,7 +132,28 @@ if (panelOnly) {
     if (changed) engine.clearFrozen();
     Object.entries(scene.presets).forEach(([gestureId, params]) => engine.setParams(gestureId, params));
     engine.reset(scene.gestosActivos);
-    stageLabel.textContent = `PIANO / ${scene.nombre.toUpperCase()}`;
+    const opticalLabActive = id === 6;
+    const dynamicOpticalActive = id === 7;
+    const viscoelasticActive = id === 8 || id === 9;
+    const viscoelasticRadianceActive = id === 9;
+    const radianceCompositionActive = id === 10;
+    stage.classList.toggle('optical-lab-active', opticalLabActive);
+    stage.classList.toggle('dynamic-optical-active', dynamicOpticalActive);
+    stage.classList.toggle('viscoelastic-active', viscoelasticActive);
+    stage.classList.toggle('radiance-composition-active', radianceCompositionActive);
+    opticalLabLegend.hidden = !opticalLabActive;
+    dynamicOpticalLegend.hidden = !dynamicOpticalActive;
+    stageLabel.textContent = opticalLabActive
+      ? 'PIANO / LABORATORIO ÓPTICO'
+      : dynamicOpticalActive
+        ? 'PIANO / ÓPTICA CINÉTICA'
+        : viscoelasticRadianceActive
+          ? 'PIANO / MATERIA RADIANTE'
+          : viscoelasticActive
+          ? 'PIANO / MATERIA VISCOELÁSTICA'
+          : radianceCompositionActive
+            ? 'PIANO / ÓRBITA DE PENUMBRA'
+          : `PIANO / ${scene.nombre.toUpperCase()}`;
     revision += 1;
   }
 
@@ -149,7 +208,7 @@ if (panelOnly) {
           : action.mode === 2
             ? 'Impulso 02 activo: las partículas nacen abajo y se acumulan hacia arriba.'
             : action.mode === 3
-              ? 'Impulso 03 activo: HRC difuso con espejo, vidrio y caústicas forward acotadas.'
+              ? 'Impulso 03 activo: bloques Box2D originales con HRC difuso; sin reflexión ni refracción.'
               : action.mode === 4
                 ? 'Impulso 04 activo: agudas suman celdas Voronoi; graves las restan.'
                 : action.mode === 5
@@ -177,7 +236,35 @@ if (panelOnly) {
           frequency: 440 * 2 ** ((midi - 69) / 12),
           strength: 0.85,
         }));
-        notice = 'Prueba visual: acorde amplio emitido; alterna la gravedad de los modos 03 y 05.';
+        notice = 'Prueba visual: acorde amplio emitido; alterna la gravedad del modo 05.';
+        revision += 1;
+      }
+      if (action.type === 'toggle-packing-gravity') {
+        const enabled = renderer?.togglePackingGravity();
+        notice = enabled === undefined
+          ? 'Q controla la gravedad solamente en 03 · BLOQUES.'
+          : `Q · Gravedad ${enabled ? 'activada' : 'suspendida'}.`;
+        revision += 1;
+      }
+      if (action.type === 'rotate-packing-scene') {
+        const rotating = renderer?.rotatePackingScene() ?? false;
+        notice = rotating
+          ? 'W · Giro manual de 90° iniciado.'
+          : 'W controla el giro solamente en 03 · BLOQUES; esperá a que termine el giro actual.';
+        revision += 1;
+      }
+      if (action.type === 'toggle-lit-scale') {
+        const targetScale = renderer?.toggleLitBlockScale();
+        notice = targetScale === 3
+          ? 'E · El objeto iluminado crecerá hasta 3× en 10 segundos.'
+          : targetScale === 1
+            ? 'E · El objeto iluminado volverá a 1× en 10 segundos.'
+            : 'E necesita un objeto iluminado en 03 · BLOQUES. Creá uno con Probar o tocando el piano.';
+        revision += 1;
+      }
+      if (action.type === 'radiance-composition-control') {
+        notice = renderer?.controlRadianceComposition(action.control)
+          ?? 'A/S/D/F/G controlan la composición solamente en la escena 10.';
         revision += 1;
       }
       if (action.type === 'reset-packing') {
@@ -211,7 +298,28 @@ if (panelOnly) {
         engine.clearFrozen();
         Object.entries(scene.presets).forEach(([gestureId, params]) => engine.setParams(gestureId, params));
         engine.reset(scene.gestosActivos);
-        stageLabel.textContent = `PIANO / ${scene.nombre.toUpperCase()}`;
+        const opticalLabActive = scene.id === 6;
+        const dynamicOpticalActive = scene.id === 7;
+        const viscoelasticActive = scene.id === 8 || scene.id === 9;
+        const viscoelasticRadianceActive = scene.id === 9;
+        const radianceCompositionActive = scene.id === 10;
+        stage.classList.toggle('optical-lab-active', opticalLabActive);
+        stage.classList.toggle('dynamic-optical-active', dynamicOpticalActive);
+        stage.classList.toggle('viscoelastic-active', viscoelasticActive);
+        stage.classList.toggle('radiance-composition-active', radianceCompositionActive);
+        opticalLabLegend.hidden = !opticalLabActive;
+        dynamicOpticalLegend.hidden = !dynamicOpticalActive;
+        stageLabel.textContent = opticalLabActive
+          ? 'PIANO / LABORATORIO ÓPTICO'
+          : dynamicOpticalActive
+            ? 'PIANO / ÓPTICA CINÉTICA'
+            : viscoelasticRadianceActive
+              ? 'PIANO / MATERIA RADIANTE'
+              : viscoelasticActive
+              ? 'PIANO / MATERIA VISCOELÁSTICA'
+              : radianceCompositionActive
+                ? 'PIANO / ÓRBITA DE PENUMBRA'
+              : `PIANO / ${scene.nombre.toUpperCase()}`;
         saveShowConfig(localStorage, sceneMachine.showConfig);
         notice = 'Preset importado y guardado.';
         revision += 1;
@@ -235,7 +343,9 @@ if (panelOnly) {
   transcriber.subscribeStatus((state, error) => {
     transcriberStatus = state;
     transcriberError = error;
-    if (state === 'ready') notice = 'Detector polifónico listo: partículas por nota individual.';
+    if (state === 'ready' && notice === null) {
+      notice = 'Detector polifónico listo: partículas por nota individual.';
+    }
     if (state === 'error') notice = `Detector polifónico no disponible: ${error ?? 'error desconocido.'}`;
     revision += 1;
   });
@@ -267,20 +377,28 @@ if (panelOnly) {
     const dt = Math.min(0.1, Math.max(0.001, (now - lastRender) / 1000));
     lastRender = now;
     const audioFrames = analyzer.takeFrames();
+    musicAnalysis = summarizeMusicAnalysis(audioFrames, musicAnalysis, dt);
     const noteAttacks: DetectedNote[] = [];
     let wideChord = false;
-    if (impulseMode === 1 || impulseMode === 2 || impulseMode === 3 || impulseMode === 4 || impulseMode === 5) {
+    const dynamicOpticalActive = sceneMachine.scene.id === 7;
+    const viscoelasticActive = sceneMachine.scene.id === 8
+      || sceneMachine.scene.id === 9;
+    if (dynamicOpticalActive || impulseMode === 1 || impulseMode === 2 || impulseMode === 3 || impulseMode === 4 || impulseMode === 5) {
       const testAttacks = pendingTestNotes;
       pendingTestNotes = [];
       const modelAttacks = transcriber.takeNotes();
       const nativeAttacks = audioFrames.flatMap((frame) => frame.noteAttacks);
-      wideChord = (impulseMode === 3 || impulseMode === 5)
+      wideChord = !viscoelasticActive
+        && (dynamicOpticalActive || impulseMode === 5)
         && chordSwitch.push([...testAttacks, ...nativeAttacks, ...modelAttacks], now / 1000);
       modelNoteCount += modelAttacks.length;
       nativeNoteCount += nativeAttacks.length;
       // A piano tone has several harmonics. For impulse effects, those are one
       // musical attack, so only the strongest native candidate gets one mark.
-      const attack = testAttacks[0] ?? strongestAttack(nativeAttacks);
+      const attack = testAttacks[0] ?? strongestAttack([
+        ...modelAttacks,
+        ...nativeAttacks,
+      ]);
       if (attack && (testAttacks.length > 0 || now - lastImpulseAt >= 90)) {
         lastImpulseAt = now;
         noteAttacks.push(attack);
@@ -297,6 +415,7 @@ if (panelOnly) {
       visualFrame.impulseMode = impulseMode;
       visualFrame.noteAttacks = noteAttacks;
       visualFrame.wideChord = wideChord;
+      visualFrame.music = musicAnalysis;
       renderer.apply(visualFrame);
       renderer.render(dt, now / 1000);
       const nextRendererStatus = renderer.getStatus();

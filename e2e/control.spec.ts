@@ -58,6 +58,15 @@ test('un host visual sincroniza escenas, parámetros, blackout y calidad con un 
     await expect(visual.locator(`[data-scene="${scene}"]`)).toHaveClass(/active/);
     await expect(panel.locator(`[data-scene="${scene}"]`)).toHaveClass(/active/);
   }
+  await panel.locator('[data-scene="8"]').click();
+  await expect(visual.locator('[data-scene="8"]')).toHaveClass(/active/);
+  await expect(panel.locator('[data-impulse-hint-text]')).toContainText('Fluido viscoelástico');
+  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('fluido 1200 partículas');
+  await panel.locator('[data-action="test-note"]').click();
+  await panel.locator('[data-scene="9"]').click();
+  await expect(visual.locator('[data-scene="9"]')).toHaveClass(/active/);
+  await expect(panel.locator('[data-impulse-hint-text]')).toContainText('HRC');
+  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText(/HRC (512|256)²/);
   await visual.keyboard.press('3');
   await expect(panel.locator('[data-scene="3"]')).toHaveClass(/active/);
 
@@ -114,6 +123,127 @@ test('un host visual sincroniza escenas, parámetros, blackout y calidad con un 
   await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('safe');
 
   expect(consoleErrors).toEqual([]);
+  await context.close();
+});
+
+test('los bloques controlan gravedad, giro y escala iluminada con Q, W y E', async ({ browser }) => {
+  const context = await browser.newContext();
+  const { visual, panel } = await openShow(context);
+  await panel.locator('[data-impulse="3"]').click();
+  await panel.locator('[data-action="test-note"]').click();
+  await expect(panel.locator('[data-note-pitches]')).toContainText('C4');
+
+  await expect(panel.locator('[data-impulse-hint-text]')).toContainText('Q gravedad ON');
+  await visual.keyboard.press('q');
+  await expect(panel.locator('[data-impulse-hint-text]')).toContainText('Q gravedad OFF');
+  await visual.waitForTimeout(6_500);
+  await expect(panel.locator('[data-impulse-hint-text]')).toContainText('W gira 90° (0°)');
+
+  await visual.keyboard.press('w');
+  await expect(panel.locator('.notice:not(.mic-remote-hint)')).toContainText('Giro manual de 90° iniciado');
+
+  await visual.keyboard.press('e');
+  await expect(panel.locator('.notice:not(.mic-remote-hint)')).toContainText('crecerá hasta 3× en 10 segundos');
+  await expect(panel.locator('[data-impulse-hint-text]')).toContainText('crece a 3×');
+  await visual.waitForTimeout(5_000);
+  const midpointHint = await panel.locator('[data-impulse-hint-text]').innerText();
+  const midpointScale = Number(midpointHint.match(/E emisor ([\d.]+)×/)?.[1]);
+  const midpointPhysicsScale = Number(midpointHint.match(/física ([\d.]+)×/)?.[1]);
+  const midpointMassScale = Number(midpointHint.match(/masa ([\d.]+)×/)?.[1]);
+  expect(midpointScale).toBeGreaterThan(1.6);
+  expect(midpointScale).toBeLessThan(2.2);
+  expect(midpointPhysicsScale).toBeGreaterThan(1.6);
+  expect(Math.abs(midpointPhysicsScale - midpointScale)).toBeLessThan(0.08);
+  expect(midpointMassScale).toBeGreaterThan(2.5);
+  expect(Math.abs(midpointMassScale - midpointPhysicsScale ** 2)).toBeLessThan(0.25);
+  expect(midpointHint).toContain('W gira 90° (90°)');
+  await visual.waitForTimeout(5_500);
+  const expandedHint = await panel.locator('[data-impulse-hint-text]').innerText();
+  const expandedScale = Number(expandedHint.match(/E emisor ([\d.]+)×/)?.[1]);
+  const expandedPhysicsScale = Number(expandedHint.match(/física ([\d.]+)×/)?.[1]);
+  const expandedMassScale = Number(expandedHint.match(/masa ([\d.]+)×/)?.[1]);
+  expect(expandedScale).toBeGreaterThan(2.85);
+  expect(expandedPhysicsScale).toBeGreaterThan(2.85);
+  expect(expandedMassScale).toBeGreaterThan(8);
+  await visual.keyboard.press('e');
+  await expect(panel.locator('.notice:not(.mic-remote-hint)')).toContainText('volverá a 1× en 10 segundos');
+  await expect(panel.locator('[data-impulse-hint-text]')).toContainText('vuelve a 1×');
+
+  await context.close();
+});
+
+test('la escena 10 responde suavemente a A–G y limita sus emisores', async ({ browser }) => {
+  const context = await browser.newContext();
+  const { visual, panel } = await openShow(context);
+
+  await visual.keyboard.press('0');
+  const sceneButton = panel.locator('[data-scene="10"]');
+  await expect(sceneButton).toHaveClass(/active/);
+  await expect(sceneButton).toContainText('Órbita de Penumbra');
+
+  const controls = panel.locator('[data-radiance-control]');
+  await expect(controls).toHaveCount(5);
+  await expect(panel.locator('[data-radiance-control="a"]')).toContainText('Apariencia');
+  await expect(panel.locator('[data-radiance-control="s"]')).toContainText('Escala');
+  await expect(panel.locator('[data-radiance-control="d"]')).toContainText('Desplazamiento');
+  await expect(panel.locator('[data-radiance-control="f"]')).toContainText('Foco luminoso');
+  await expect(panel.locator('[data-radiance-control="g"]')).toContainText('Gama');
+
+  const form = panel.locator('[data-radiance-form]');
+  const scaleTarget = panel.locator('[data-radiance-scale]');
+  const scaleLive = panel.locator('[data-radiance-scale-live]');
+  const layout = panel.locator('[data-radiance-layout]');
+  const focus = panel.locator('[data-radiance-focus]');
+  const palette = panel.locator('[data-radiance-palette]');
+  const emitterCount = panel.locator('[data-radiance-emitter-count]');
+  const numericScale = async (locator: typeof scaleLive): Promise<number> => (
+    Number((await locator.textContent())?.replace('×', '').trim())
+  );
+
+  const initialForm = await form.innerText();
+  await visual.keyboard.press('a');
+  await expect(form).not.toHaveText(initialForm);
+  const changedForm = await form.innerText();
+
+  const initialScale = await numericScale(scaleLive);
+  const initialScaleTarget = await scaleTarget.innerText();
+  await visual.keyboard.press('s');
+  await expect(scaleTarget).not.toHaveText(initialScaleTarget);
+  const targetScale = await numericScale(scaleTarget);
+  await expect.poll(() => numericScale(scaleLive), { timeout: 2_500 }).toBeGreaterThan(
+    Math.min(initialScale, targetScale) + 0.005,
+  );
+  const intermediateScale = await numericScale(scaleLive);
+  expect(intermediateScale).toBeLessThan(Math.max(initialScale, targetScale) - 0.005);
+
+  const initialLayout = await layout.innerText();
+  await visual.keyboard.press('d');
+  await expect(layout).not.toHaveText(initialLayout);
+
+  const initialPalette = await palette.innerText();
+  await visual.keyboard.press('g');
+  await expect(palette).not.toHaveText(initialPalette);
+
+  const initialFocus = await focus.innerText();
+  await visual.keyboard.press('f');
+  await expect(focus).not.toHaveText(initialFocus);
+  for (let index = 0; index < 8; index += 1) {
+    await visual.keyboard.press('f');
+    await visual.waitForTimeout(55);
+  }
+  for (let sample = 0; sample < 24; sample += 1) {
+    expect(Number(await emitterCount.innerText())).toBeGreaterThanOrEqual(1);
+    expect(Number(await emitterCount.innerText())).toBeLessThanOrEqual(2);
+    await visual.waitForTimeout(80);
+  }
+
+  await visual.keyboard.press('3');
+  await expect(panel.locator('[data-scene="3"]')).toHaveClass(/active/);
+  await visual.keyboard.press('a');
+  await visual.keyboard.press('0');
+  await expect(sceneButton).toHaveClass(/active/);
+  await expect(form).toHaveText(changedForm);
+
   await context.close();
 });
 

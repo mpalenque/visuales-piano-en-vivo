@@ -12,6 +12,10 @@ export type ControlAction =
   | { type: 'impulse-mode'; mode: ImpulseMode }
   | { type: 'test-note'; midi?: number }
   | { type: 'test-chord' }
+  | { type: 'toggle-packing-gravity' }
+  | { type: 'rotate-packing-scene' }
+  | { type: 'toggle-lit-scale' }
+  | { type: 'radiance-composition-control'; control: 'a' | 's' | 'd' | 'f' | 'g' }
   | { type: 'reset-packing' }
   | { type: 'recalibrate' }
   | { type: 'start-audio' }

@@ -34,7 +34,18 @@ const initialStatus: SystemStatus = {
     drawCalls: 0, geometries: 0, textures: 0, contextLosses: 0,
     fpsAverage: 0, frameTimeP95Ms: 0, tabVisible: true,
     voronoiCells: 5, packingGravityEnabled: true,
-    hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 2, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
+    packingCameraRotationDegrees: 0, packingEmitterScale: 1, packingEmitterScaleTarget: 1,
+    packingEmitterPhysicsScale: 1, packingEmitterMassScale: 1,
+    fluidActive: false, fluidParticleCount: 0, fluidSpringCount: 0,
+    radianceCompositionActive: false,
+    radianceCompositionForm: '—',
+    radianceCompositionScale: 1,
+    radianceCompositionScaleTarget: 1,
+    radianceCompositionLayout: '—',
+    radianceCompositionFocus: '—',
+    radianceCompositionPalette: '—',
+    radianceCompositionEmitterCount: 0,
+    hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 4, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
     causticsActive: false, causticsQuality: 'high', causticsEmitterCount: 0,
     causticsMaterialCount: 0, causticsRayCount: 0, causticsHitCount: 0,
     causticsPointCount: 0, causticsUpdateHz: 0, causticsCpuTimeMs: 0,
@@ -46,6 +57,7 @@ export class DirectorPanel {
   private status: SystemStatus = initialStatus;
   private visible = true;
   private testNotePreview: string | null = null;
+  private testNotePreviewUntil = 0;
   private readonly unsubscribeStatus: () => void;
   private readonly unsubscribeConnection: () => void;
   private connection: VisualConnection;
@@ -54,7 +66,12 @@ export class DirectorPanel {
     this.unsubscribeStatus = this.bus.onStatus((status) => {
       const needsRender = status.revision !== this.status.revision || status.activeScene !== this.status.activeScene;
       this.status = status;
-      if (status.detectedNotes.length > 0) this.testNotePreview = null;
+      if (status.detectedNotes.length > 0) {
+        this.testNotePreview = status.detectedNotes.join(' · ');
+        this.testNotePreviewUntil = performance.now() + 1_800;
+      } else if (performance.now() > this.testNotePreviewUntil) {
+        this.testNotePreview = null;
+      }
       if (needsRender) this.render();
       else this.updateLiveStatus();
     });
@@ -105,10 +122,11 @@ export class DirectorPanel {
       ${audio.error ? `<p class="error">${escapeHtml(audio.error)}</p>` : ''}
       ${this.status.notice ? `<p class="notice">${escapeHtml(this.status.notice)}</p>` : ''}
       <section>
-        <div class="section-title"><h2>Escenas</h2><span>Teclas 1–6</span></div>
+        <div class="section-title"><h2>Escenas</h2><span>Teclas 1–9 · 0 = escena 10</span></div>
         <div class="scene-grid">${this.status.config.scenes.map((item) => `<button class="scene-button ${item.id === scene.id ? 'active' : ''}" data-scene="${item.id}"><b>${item.id}</b><span>${escapeHtml(item.nombre)}</span></button>`).join('')}</div>
         <p class="scene-notes">${escapeHtml(scene.notes)}</p>
       </section>
+      ${scene.id === 10 ? this.radianceControls() : ''}
       <section class="quick-actions">
         ${audioControl}
         <button data-action="recalibrate" ${audio.running ? '' : 'disabled'}>Recalibrar · 10 s</button>
@@ -119,7 +137,7 @@ export class DirectorPanel {
       </section>
       ${this.panelOnly ? '<p class="notice mic-remote-hint" data-mic-remote-hint>Por seguridad del navegador, activá el micrófono en la vista visual (la pestaña sin <code>?mode=panel</code>).</p>' : ''}
       <section>
-        <div class="section-title"><h2>Impulsos</h2><span><button class="impulse-test" data-action="test-note">Probar</button>${this.status.impulseMode === 3 || this.status.impulseMode === 5 ? ' <button class="impulse-test" data-action="test-chord">Acorde ↕ gravedad</button>' : ''} <b data-note-impulse-count>${this.status.detectedNoteCount}</b> notas</span></div>
+        <div class="section-title"><h2>Impulsos</h2><span><button class="impulse-test" data-action="test-note">Probar</button>${this.status.impulseMode === 5 ? ' <button class="impulse-test" data-action="test-chord">Acorde ↕ gravedad</button>' : ''} <b data-note-impulse-count>${this.status.detectedNoteCount}</b> notas</span></div>
         <div class="impulse-grid">${impulseModes.map((mode) => `<button class="impulse-button ${this.status.impulseMode === mode ? 'active' : ''} ${mode <= 5 ? '' : 'reserved'}" data-impulse="${mode}" ${mode <= 5 ? '' : 'disabled'}><b>${String(mode).padStart(2, '0')}</b><span>${mode === 1 ? 'NOTA' : mode === 2 ? 'ACUMULA' : mode === 3 ? 'BLOQUES' : mode === 4 ? 'VORONOI' : mode === 5 ? 'POLÍGONOS' : 'PRÓX.'}</span></button>`).join('')}</div>
         <p class="impulse-hint" data-impulse-hint><span data-impulse-hint-text>${this.impulseHint()}</span><br><b data-note-pitches>${this.notePitches()}</b> · <small data-note-debug>entrada 0 · rápido 0 · IA 0</small></p>
         ${this.status.impulseMode === 4 ? `<div class="voronoi-controls">
@@ -144,7 +162,11 @@ export class DirectorPanel {
       </section>
       <section>
         <div class="section-title"><h2>Override manual</h2><span>La red de seguridad</span></div>
-        <div class="override-grid">${visualParameterTargets.filter((target) => target !== 'grain' && target !== 'saturation').map((target) => this.overrideControl(target, scene.baseParams[target] ?? 0)).join('')}</div>
+        <div class="override-grid">${visualParameterTargets.filter((target) => (
+          target !== 'grain'
+          && target !== 'saturation'
+          && (scene.id === 9 || (target !== 'radiance' && target !== 'beat'))
+        )).map((target) => this.overrideControl(target, scene.baseParams[target] ?? 0)).join('')}</div>
       </section>
       <section class="persistence">
         <button data-action="save">Guardar local</button>
@@ -155,6 +177,25 @@ export class DirectorPanel {
       </section>
     `;
     this.bind();
+  }
+
+  private radianceControls(): string {
+    const renderer = this.status.renderer;
+    const emitterCount = Math.max(1, Math.min(2, renderer.radianceCompositionEmitterCount || 1));
+    return `<section class="radiance-controls" aria-label="Control manual de la composición radiante">
+      <div class="radiance-control-heading">
+        <div><p>RADIANCE / DIRECTO</p><strong>Composición manual</strong></div>
+        <span class="radiance-emitter-chip ${emitterCount === 1 ? 'solo' : ''}" data-radiance-emitter-chip><i></i><b data-radiance-emitter-count>${emitterCount}</b> <span data-radiance-emitter-label>${emitterCount === 1 ? 'emisor' : 'emisores'}</span></span>
+      </div>
+      <div class="radiance-key-grid">
+        <button data-radiance-control="a"><kbd>A</kbd><span>Apariencia</span><strong data-radiance-form>${escapeHtml(renderer.radianceCompositionForm || '—')}</strong></button>
+        <button data-radiance-control="s"><kbd>S</kbd><span>Escala</span><strong data-radiance-scale>${number(renderer.radianceCompositionScaleTarget, 2)}×</strong></button>
+        <button data-radiance-control="d"><kbd>D</kbd><span>Desplazamiento</span><strong data-radiance-layout>${escapeHtml(renderer.radianceCompositionLayout || '—')}</strong></button>
+        <button data-radiance-control="f"><kbd>F</kbd><span>Foco luminoso</span><strong data-radiance-focus>${escapeHtml(renderer.radianceCompositionFocus || '—')}</strong></button>
+        <button data-radiance-control="g"><kbd>G</kbd><span>Gama</span><strong data-radiance-palette>${escapeHtml(renderer.radianceCompositionPalette || '—')}</strong></button>
+      </div>
+      <p class="radiance-live-line"><span>transición continua</span><b data-radiance-scale-live>${number(renderer.radianceCompositionScale, 2)}×</b><i aria-hidden="true"></i><span>máximo dos luces</span></p>
+    </section>`;
   }
 
   private gestureCard(id: string, output: GestureOutput | undefined, params: Record<string, number>): string {
@@ -189,6 +230,9 @@ export class DirectorPanel {
 
   private bind(): void {
     this.root.querySelectorAll<HTMLButtonElement>('[data-scene]').forEach((button) => button.addEventListener('click', () => this.dispatch({ type: 'scene', id: Number(button.dataset.scene) })));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-radiance-control]').forEach((button) => button.addEventListener('click', () => {
+      this.dispatch({ type: 'radiance-composition-control', control: button.dataset.radianceControl as 'a' | 's' | 'd' | 'f' | 'g' });
+    }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-event]').forEach((button) => button.addEventListener('click', () => this.dispatch({ type: 'force-event', event: button.dataset.event as 'estalla' | 'climax' | 'pulso' })));
     this.root.querySelector<HTMLButtonElement>('[data-action="audio"]')?.addEventListener('click', () => this.dispatch({ type: 'start-audio' }));
     this.root.querySelector<HTMLButtonElement>('[data-action="test-note"]')?.addEventListener('click', () => this.dispatch({ type: 'test-note' }));
@@ -246,6 +290,16 @@ export class DirectorPanel {
     this.setText('[data-note-pitches]', this.notePitches());
     this.setText('[data-impulse-hint-text]', this.impulseHint());
     this.setText('[data-voronoi-cells]', String(this.status.renderer.voronoiCells));
+    this.setText('[data-radiance-form]', this.status.renderer.radianceCompositionForm || '—');
+    this.setText('[data-radiance-scale]', `${number(this.status.renderer.radianceCompositionScaleTarget, 2)}×`);
+    this.setText('[data-radiance-scale-live]', `${number(this.status.renderer.radianceCompositionScale, 2)}×`);
+    this.setText('[data-radiance-layout]', this.status.renderer.radianceCompositionLayout || '—');
+    this.setText('[data-radiance-focus]', this.status.renderer.radianceCompositionFocus || '—');
+    this.setText('[data-radiance-palette]', this.status.renderer.radianceCompositionPalette || '—');
+    const emitterCount = Math.max(1, Math.min(2, this.status.renderer.radianceCompositionEmitterCount || 1));
+    this.setText('[data-radiance-emitter-count]', String(emitterCount));
+    this.setText('[data-radiance-emitter-label]', emitterCount === 1 ? 'emisor' : 'emisores');
+    this.root.querySelector('[data-radiance-emitter-chip]')?.classList.toggle('solo', emitterCount === 1);
     this.setText('[data-note-debug]', `entrada ${this.status.audioChunkCount} · Worker ${this.status.transcriberTelemetry.inputChunks} · rápido ${this.status.nativeNoteCount} · IA ${this.status.modelNoteCount} · ventanas ${this.status.transcriberTelemetry.windows} · pico ${number(this.status.transcriberTelemetry.peakOnset, 2)}`);
     this.root.querySelector('[data-status-card="mic"]')?.classList.toggle('ok', audio.running);
     this.root.querySelector('[data-status-card="fps"]')?.classList.toggle('ok', this.status.fps >= 110);
@@ -286,11 +340,26 @@ export class DirectorPanel {
   private rendererDetail(): string {
     const renderer = this.status.renderer;
     const resolution = renderer.width && renderer.height ? `${renderer.width}×${renderer.height}` : 'sin canvas';
+    if (this.status.activeScene === 8) {
+      return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · fluido ${renderer.fluidParticleCount} partículas/${renderer.fluidSpringCount} resortes · escena ${renderer.drawCalls} calls · ${renderer.geometries}G/${renderer.textures}T`;
+    }
     const hrcMemory = renderer.hrcTargetMemoryBytes / (1024 * 1024);
-    const packingOptics = this.status.impulseMode === 3 || this.status.impulseMode === 5;
-    const caustics = packingOptics
-      ? ` · óptica ${renderer.causticsQuality}/${renderer.causticsRayCount}R/${renderer.causticsHitCount}H/${number(renderer.causticsCpuTimeMs, 2)} ms`
-      : ` · óptica ${renderer.causticsQuality}`;
+    if (this.status.activeScene === 9) {
+      return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · fluido ${renderer.fluidParticleCount} partículas/${renderer.fluidSpringCount} resortes · HRC ${renderer.hrcResolution}²/${number(renderer.hrcUpdateHz, 0)} Hz/${renderer.hrcFrustumsPerFrame}F · ${number(hrcMemory, 0)} MB · escena ${renderer.drawCalls} calls`;
+    }
+    if (this.status.activeScene === 10) {
+      const emitterCount = Math.max(1, Math.min(2, renderer.radianceCompositionEmitterCount || 1));
+      return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · HRC ${renderer.hrcResolution}²/${number(renderer.hrcUpdateHz, 0)} Hz/${renderer.hrcFrustumsPerFrame}F · ${number(hrcMemory, 0)} MB · ${renderer.radianceCompositionForm || 'composición'} · ${number(renderer.radianceCompositionScale, 2)}× · ${emitterCount} ${emitterCount === 1 ? 'emisor' : 'emisores'}`;
+    }
+    const packingOptics = this.status.activeScene === 6 || this.status.activeScene === 7
+      || this.status.impulseMode === 5;
+    const caustics = this.status.activeScene === 6
+      ? ` · óptica ${renderer.causticsQuality}/${renderer.causticsRayCount}spp/${renderer.causticsHitCount} frames/${number(renderer.causticsCpuTimeMs, 2)} ms`
+      : this.status.activeScene === 7
+        ? ` · óptica ${renderer.causticsQuality}/${renderer.causticsRayCount}R/${renderer.causticsHitCount} cuerpos/${number(renderer.causticsCpuTimeMs, 2)} ms`
+      : packingOptics
+        ? ` · óptica ${renderer.causticsQuality}/${renderer.causticsRayCount}R/${renderer.causticsHitCount}H/${number(renderer.causticsCpuTimeMs, 2)} ms`
+        : ` · óptica ${renderer.causticsQuality}`;
     return `${renderer.quality} · DPR ${number(renderer.pixelRatio, 1)} · ${resolution} · HRC ${renderer.hrcResolution}²/${number(renderer.hrcUpdateHz, 0)} Hz/${renderer.hrcFrustumsPerFrame}F/${renderer.hrcDrawCalls} calls · ${number(hrcMemory, 0)} MB${caustics} · escena ${renderer.drawCalls} calls · ${renderer.geometries}G/${renderer.textures}T`;
   }
 
@@ -307,8 +376,21 @@ export class DirectorPanel {
   }
 
   private impulseHint(): string {
+    if (this.status.activeScene === 6) return 'ESCENA 6 · Objetos fijos. El campo se calcula con SDF, reflexión, Snell, Fresnel, reflexión interna total y absorción Beer–Lambert en GPU.';
+    if (this.status.activeScene === 7) return `ESCENA 7 · Box2D vivo. Emisores, espejos, metal rugoso y vidrio se cruzan con rayos directos reflect/refract; no hay acumulación Monte Carlo, por eso baja el noise. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.activeScene === 8) return `ESCENA 8 · Fluido viscoelástico. ${this.status.renderer.fluidParticleCount} partículas con hashing espacial, doble densidad, viscosidad y ${this.status.renderer.fluidSpringCount} resortes plásticos. El botón Probar agita la materia.`;
+    if (this.status.activeScene === 9) return `ESCENA 9 · Alterna entre 1 y 4 focos visibles según la complejidad musical. Sólo una minoría de partículas emite; chroma/centroide cambian color y graves, agudos, flux, ataques, pulso y clímax redistribuyen luces y sombras HRC a 512² en calidad alta.`;
+    if (this.status.activeScene === 10) {
+      const renderer = this.status.renderer;
+      const emitterCount = Math.max(1, Math.min(2, renderer.radianceCompositionEmitterCount || 1));
+      return `ESCENA 10 · Radiance manual y sin física. A apariencia: ${renderer.radianceCompositionForm || '—'} · S escala: ${number(renderer.radianceCompositionScale, 2)}→${number(renderer.radianceCompositionScaleTarget, 2)}× · D desplazamiento: ${renderer.radianceCompositionLayout || '—'} · F foco: ${renderer.radianceCompositionFocus || '—'} (${emitterCount} ${emitterCount === 1 ? 'emisor' : 'emisores'}) · G gama: ${renderer.radianceCompositionPalette || '—'}. Cada cambio entra suave y modifica las sombras.`;
+    }
     if (this.status.impulseMode === 2) return '02 · Cada toque nace abajo y queda acumulado, llenando hacia arriba.';
-    if (this.status.impulseMode === 3) return `03 · Materiales: VIDRIO = cian transparente · ESPEJO = plata/cromo · DIFUSO = gris · EMISOR = luz. HRC + óptica forward, sin post extra. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
+    if (this.status.impulseMode === 3) {
+      const renderer = this.status.renderer;
+      const scaleDirection = renderer.packingEmitterScaleTarget === 3 ? 'crece a 3×' : 'vuelve a 1×';
+      return `03 · BLOQUES + CÍRCULOS. Cada toque deja caer 2–5 cuerpos Box2D según su fuerza; varios son emisores HRC reales y cambian de grupo cada 12 s. Sin cielo en el fondo: cada cuerpo conserva sólo su fragmento de máscara desplazada. Q gravedad ${renderer.packingGravityEnabled ? 'ON' : 'OFF'} · W gira 90° (${number(renderer.packingCameraRotationDegrees, 0)}°) · E emisores ${number(renderer.packingEmitterScale, 2)}× / física ${number(renderer.packingEmitterPhysicsScale, 2)}× / masa ${number(renderer.packingEmitterMassScale, 2)}×, ${scaleDirection} en 10 s.`;
+    }
     if (this.status.impulseMode === 4) return '04 · Agudas suman y graves restan. Chaser espacial: cada celda revela una vista satelital distinta.';
     if (this.status.impulseMode === 5) return `05 · Materiales: VIDRIO = cian transparente · ESPEJO = plata/cromo · DIFUSO = gris · EMISOR = luz. Morph + HRC + caústicas forward. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     return '01 · Un ataque, una partícula blanca de 3 s. Se desplaza, achica y desvanece.';
@@ -324,6 +406,7 @@ export class DirectorPanel {
   private dispatch(action: ControlAction): void {
     if (action.type === 'test-note') {
       this.testNotePreview = noteLabel(action.midi ?? 60);
+      this.testNotePreviewUntil = performance.now() + 1_800;
       this.status = {
         ...this.status,
         detectedNotes: [this.testNotePreview],
@@ -338,13 +421,34 @@ export class DirectorPanel {
   }
 
   private onKeydown = (event: KeyboardEvent): void => {
-    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement || event.target instanceof HTMLTextAreaElement) return;
-    const scene = Number(event.key);
-    if (scene >= 1 && scene <= 6) this.dispatch({ type: 'scene', id: scene });
-    if (event.key.toLowerCase() === 'b') this.dispatch({ type: 'blackout', value: !this.status.blackout });
-    if (event.key.toLowerCase() === 'r') { event.preventDefault(); this.dispatch({ type: 'reset-packing' }); }
+    if (
+      event.target instanceof HTMLInputElement
+      || event.target instanceof HTMLSelectElement
+      || event.target instanceof HTMLTextAreaElement
+      || (event.target instanceof HTMLElement && event.target.isContentEditable)
+    ) return;
+    const key = event.key.toLowerCase();
+    const plainPress = !event.repeat && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+    if (plainPress) {
+      const scene = key === '0' ? 10 : Number(key);
+      if (scene >= 1 && scene <= 10) {
+        event.preventDefault();
+        this.dispatch({ type: 'scene', id: scene });
+        return;
+      }
+      if (this.status.activeScene === 10 && (key === 'a' || key === 's' || key === 'd' || key === 'f' || key === 'g')) {
+        event.preventDefault();
+        this.dispatch({ type: 'radiance-composition-control', control: key });
+        return;
+      }
+    }
+    if (key === 'b') this.dispatch({ type: 'blackout', value: !this.status.blackout });
+    if (key === 'r') { event.preventDefault(); this.dispatch({ type: 'reset-packing' }); }
+    if (!event.repeat && key === 'q') { event.preventDefault(); this.dispatch({ type: 'toggle-packing-gravity' }); }
+    if (!event.repeat && key === 'w') { event.preventDefault(); this.dispatch({ type: 'rotate-packing-scene' }); }
+    if (!event.repeat && key === 'e') { event.preventDefault(); this.dispatch({ type: 'toggle-lit-scale' }); }
     if (event.key === ' ') { event.preventDefault(); this.dispatch({ type: 'force-event', event: 'estalla' }); }
-    if (!this.panelOnly && event.key.toLowerCase() === 'p') { this.visible = !this.visible; this.render(); }
+    if (!this.panelOnly && key === 'p') { this.visible = !this.visible; this.render(); }
   };
 
   private exportJson(): void {

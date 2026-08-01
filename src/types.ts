@@ -10,6 +10,20 @@ export interface DetectedNote {
   strength: number;
 }
 
+/** Compact musical state passed to visuals after aggregating AudioWorklet frames. */
+export interface MusicAnalysisFrame {
+  rms: number;
+  bass: number;
+  mid: number;
+  treble: number;
+  onset: number;
+  flux: number;
+  centroid: number;
+  harmonicCenter: number;
+  harmonicConfidence: number;
+  harmonicSpread: number;
+}
+
 /** Contract Capa 1 → Capa 2. Every numerical feature is normalized to 0–1. */
 export interface FeatureFrame {
   t: number;
@@ -96,6 +110,7 @@ export interface VisualFrame {
   impulseMode: ImpulseMode;
   noteAttacks: DetectedNote[];
   wideChord: boolean;
+  music?: MusicAnalysisFrame;
 }
 
 export interface AudioStatus {
@@ -124,6 +139,22 @@ export interface RendererStatus {
   tabVisible: boolean;
   voronoiCells: number;
   packingGravityEnabled: boolean;
+  packingCameraRotationDegrees: number;
+  packingEmitterScale: number;
+  packingEmitterScaleTarget: 1 | 3;
+  packingEmitterPhysicsScale: number;
+  packingEmitterMassScale: number;
+  fluidActive: boolean;
+  fluidParticleCount: number;
+  fluidSpringCount: number;
+  radianceCompositionActive: boolean;
+  radianceCompositionForm: string;
+  radianceCompositionScale: number;
+  radianceCompositionScaleTarget: number;
+  radianceCompositionLayout: string;
+  radianceCompositionFocus: string;
+  radianceCompositionPalette: string;
+  radianceCompositionEmitterCount: number;
   hrcResolution: number;
   hrcUpdateHz: number;
   hrcFrustumsPerFrame: number;
