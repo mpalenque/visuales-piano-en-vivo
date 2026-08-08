@@ -45,7 +45,7 @@ const initialStatus: SystemStatus = {
     radianceCompositionFocus: '—',
     radianceCompositionPalette: '—',
     radianceCompositionEmitterCount: 0,
-    hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 4, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
+    hrcResolution: 1024, hrcUpdateHz: 0, hrcFrustumsPerFrame: 4, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
     causticsActive: false, causticsQuality: 'high', causticsEmitterCount: 0,
     causticsMaterialCount: 0, causticsRayCount: 0, causticsHitCount: 0,
     causticsPointCount: 0, causticsUpdateHz: 0, causticsCpuTimeMs: 0,
@@ -379,7 +379,7 @@ export class DirectorPanel {
     if (this.status.activeScene === 6) return 'ESCENA 6 · Objetos fijos. El campo se calcula con SDF, reflexión, Snell, Fresnel, reflexión interna total y absorción Beer–Lambert en GPU.';
     if (this.status.activeScene === 7) return `ESCENA 7 · Box2D vivo. Emisores, espejos, metal rugoso y vidrio se cruzan con rayos directos reflect/refract; no hay acumulación Monte Carlo, por eso baja el noise. Gravedad ${this.status.renderer.packingGravityEnabled ? 'ON' : 'OFF'}.`;
     if (this.status.activeScene === 8) return `ESCENA 8 · Fluido viscoelástico. ${this.status.renderer.fluidParticleCount} partículas con hashing espacial, doble densidad, viscosidad y ${this.status.renderer.fluidSpringCount} resortes plásticos. El botón Probar agita la materia.`;
-    if (this.status.activeScene === 9) return `ESCENA 9 · Alterna entre 1 y 4 focos visibles según la complejidad musical. Sólo una minoría de partículas emite; chroma/centroide cambian color y graves, agudos, flux, ataques, pulso y clímax redistribuyen luces y sombras HRC a 512² en calidad alta.`;
+    if (this.status.activeScene === 9) return `ESCENA 9 · Alterna entre 1 y 4 focos visibles según la complejidad musical. Sólo una minoría de partículas emite; chroma/centroide cambian color y graves, agudos, flux, ataques, pulso y clímax redistribuyen luces y sombras HRC a 1024² en calidad alta.`;
     if (this.status.activeScene === 10) {
       const renderer = this.status.renderer;
       const emitterCount = Math.max(1, Math.min(2, renderer.radianceCompositionEmitterCount || 1));

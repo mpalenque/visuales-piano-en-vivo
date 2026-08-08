@@ -28,9 +28,8 @@ import {
 import { ViscoelasticFluidField } from './viscoelastic-fluid/field';
 import { MAX_VORONOI_CELLS, VoronoiField, type VoronoiCellSnapshot } from './voronoi-field';
 
-// Deliberately small: this renderer is the MVP/concept visual, not the final
-// particle piece. Keeping the point count and render resolution low leaves
-// headroom for a 120 Hz screen, audio analysis and the control panel.
+// The point budget stays deliberately compact so the high-resolution canvas
+// and radiance transport retain headroom for audio analysis and the panel.
 const MVP_POINTS = 900;
 const SAFE_POINTS = 320;
 const MAX_NOTE_PARTICLES = 96;
@@ -600,7 +599,7 @@ export class ReactiveVisualRenderer {
     this.viscoelasticFluid.setParams(frame.params);
     this.viscoelasticFluid.setMusicAnalysis(frame.music);
     this.amitabhaField.setDisplaySharpness(
-      viscoelasticRadianceActive ? 0.78 : 0.42,
+      viscoelasticRadianceActive ? 0.55 : 0.25,
     );
     // The cloud remains available to the Box2D mask shader, but never paints
     // the full-screen background in any scene (including the fluid pass).
@@ -716,7 +715,7 @@ export class ReactiveVisualRenderer {
         this.renderer.clear();
         return;
       }
-      this.opticalLab.render();
+      this.opticalLab.render(elapsed);
       return;
     }
 
@@ -2508,9 +2507,12 @@ export class ReactiveVisualRenderer {
   };
 
   private applyQuality(): void {
-    // High mode supersamples modestly even on a 1× display. MSAA handles
-    // triangle coverage while the shader resolves translucent silhouettes.
-    const pixelRatio = this.quality === 'safe' ? 0.65 : 1.2;
+    // Honour HiDPI displays and supersample ordinary 1× projectors. Capping
+    // DPR at 2 avoids runaway framebuffer cost on 3×/4× laptop panels.
+    const displayPixelRatio = window.devicePixelRatio || 1;
+    const pixelRatio = this.quality === 'safe'
+      ? Math.min(1, displayPixelRatio)
+      : Math.min(2, Math.max(1.5, displayPixelRatio));
     this.renderer.setPixelRatio(pixelRatio);
     this.viscoelasticFluid.setPixelRatio(pixelRatio);
   }
@@ -2551,8 +2553,8 @@ export class ReactiveVisualRenderer {
 
     // Scene 9 uses a 1024² particle transport mask and an edge-aware display
     // resolve specifically to preserve small emitters and their shadow edges.
-    // Letting a transient entrance/compile spike demote HRC to 256² defeats
-    // that detail even after the renderer has returned to 120 FPS.
+    // Letting a transient entrance/compile spike demote it defeats that detail
+    // even after the renderer has returned to a stable frame rate.
     if (this.activeScene === 9) {
       if (this.hrcQuality !== 'high') {
         this.hrcQuality = 'high';
@@ -2682,7 +2684,9 @@ export class ReactiveVisualRenderer {
     const width = canvas.clientWidth || window.innerWidth;
     const height = canvas.clientHeight || window.innerHeight;
     this.renderer.setSize(width, height, false);
-    this.opticalLab.setSize(width, height);
+    // Optical Lab follows the real drawing buffer, including the active DPR,
+    // instead of rendering to its previous fixed-size target.
+    this.opticalLab.setSize(canvas.width, canvas.height);
     this.dynamicOpticalField.setSize(width, height);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();

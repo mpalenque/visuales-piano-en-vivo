@@ -10,10 +10,16 @@ async function openShow(context: BrowserContext): Promise<{ visual: Page; panel:
 }
 
 test('un host visual sincroniza escenas, parámetros, blackout y calidad con un panel remoto', async ({ browser }) => {
+  test.setTimeout(60_000);
   const context = await browser.newContext();
   const consoleErrors: string[] = [];
   const { visual, panel } = await openShow(context);
   for (const page of [visual, panel]) page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  // CI renders WebGL through software. Exercise the same transport contract at
+  // 512² so the behavioural assertions are not dominated by 1024² raster time.
+  await panel.getByRole('button', { name: 'Modo seguro' }).click();
+  await expect(visual.locator('[data-status="webgl-detail"]')).toContainText('safe');
+  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('safe');
 
   await expect(panel.getByRole('button', { name: 'Micrófono en vista visual' })).toBeDisabled();
   await expect(panel.locator('[data-mic-remote-hint]')).toContainText('vista visual');
@@ -61,12 +67,12 @@ test('un host visual sincroniza escenas, parámetros, blackout y calidad con un 
   await panel.locator('[data-scene="8"]').click();
   await expect(visual.locator('[data-scene="8"]')).toHaveClass(/active/);
   await expect(panel.locator('[data-impulse-hint-text]')).toContainText('Fluido viscoelástico');
-  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('fluido 1200 partículas');
+  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('fluido 650 partículas');
   await panel.locator('[data-action="test-note"]').click();
   await panel.locator('[data-scene="9"]').click();
   await expect(visual.locator('[data-scene="9"]')).toHaveClass(/active/);
   await expect(panel.locator('[data-impulse-hint-text]')).toContainText('HRC');
-  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText(/HRC (512|256)²/);
+  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('HRC 512²');
   await visual.keyboard.press('3');
   await expect(panel.locator('[data-scene="3"]')).toHaveClass(/active/);
 
@@ -87,6 +93,9 @@ test('un host visual sincroniza escenas, parámetros, blackout y calidad con un 
   await expect(visual.locator('[data-param-gesture="fader-carga"][data-param-key="fuga"]')).toHaveValue('0.33');
   await panel.locator('[data-action="save"]').click();
   await visual.reload();
+  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('high');
+  await panel.getByRole('button', { name: 'Modo seguro' }).click();
+  await expect(visual.locator('[data-status="webgl-detail"]')).toContainText('safe');
   await expect(visual.locator('[data-scene="1"]')).toHaveClass(/active/);
   await panel.locator('[data-scene="2"]').click();
   await expect(visual.locator('[data-param-gesture="fader-carga"][data-param-key="fuga"]')).toHaveValue('0.33');
@@ -118,9 +127,6 @@ test('un host visual sincroniza escenas, parámetros, blackout y calidad con un 
 
   await panel.locator('[data-action="blackout"]').click();
   await expect(visual.locator('[data-action="blackout"]')).toHaveText('RESTAURAR');
-  await panel.getByRole('button', { name: 'Modo seguro' }).click();
-  await expect(visual.locator('[data-status="webgl-detail"]')).toContainText('safe');
-  await expect(panel.locator('[data-status="webgl-detail"]')).toContainText('safe');
 
   expect(consoleErrors).toEqual([]);
   await context.close();
@@ -129,6 +135,8 @@ test('un host visual sincroniza escenas, parámetros, blackout y calidad con un 
 test('los bloques controlan gravedad, giro y escala iluminada con Q, W y E', async ({ browser }) => {
   const context = await browser.newContext();
   const { visual, panel } = await openShow(context);
+  await panel.getByRole('button', { name: 'Modo seguro' }).click();
+  await expect(visual.locator('[data-status="webgl-detail"]')).toContainText('safe');
   await panel.locator('[data-impulse="3"]').click();
   await panel.locator('[data-action="test-note"]').click();
   await expect(panel.locator('[data-note-pitches]')).toContainText('C4');
@@ -147,7 +155,7 @@ test('los bloques controlan gravedad, giro y escala iluminada con Q, W y E', asy
   await expect(panel.locator('[data-impulse-hint-text]')).toContainText('crece a 3×');
   await visual.waitForTimeout(5_000);
   const midpointHint = await panel.locator('[data-impulse-hint-text]').innerText();
-  const midpointScale = Number(midpointHint.match(/E emisor ([\d.]+)×/)?.[1]);
+  const midpointScale = Number(midpointHint.match(/E emisores ([\d.]+)×/)?.[1]);
   const midpointPhysicsScale = Number(midpointHint.match(/física ([\d.]+)×/)?.[1]);
   const midpointMassScale = Number(midpointHint.match(/masa ([\d.]+)×/)?.[1]);
   expect(midpointScale).toBeGreaterThan(1.6);
@@ -159,7 +167,7 @@ test('los bloques controlan gravedad, giro y escala iluminada con Q, W y E', asy
   expect(midpointHint).toContain('W gira 90° (90°)');
   await visual.waitForTimeout(5_500);
   const expandedHint = await panel.locator('[data-impulse-hint-text]').innerText();
-  const expandedScale = Number(expandedHint.match(/E emisor ([\d.]+)×/)?.[1]);
+  const expandedScale = Number(expandedHint.match(/E emisores ([\d.]+)×/)?.[1]);
   const expandedPhysicsScale = Number(expandedHint.match(/física ([\d.]+)×/)?.[1]);
   const expandedMassScale = Number(expandedHint.match(/masa ([\d.]+)×/)?.[1]);
   expect(expandedScale).toBeGreaterThan(2.85);
@@ -175,6 +183,8 @@ test('los bloques controlan gravedad, giro y escala iluminada con Q, W y E', asy
 test('la escena 10 responde suavemente a A–G y limita sus emisores', async ({ browser }) => {
   const context = await browser.newContext();
   const { visual, panel } = await openShow(context);
+  await panel.getByRole('button', { name: 'Modo seguro' }).click();
+  await expect(visual.locator('[data-status="webgl-detail"]')).toContainText('safe');
 
   await visual.keyboard.press('0');
   const sceneButton = panel.locator('[data-scene="10"]');
@@ -273,15 +283,18 @@ test('la óptica forward se reporta sin reemplazar el HRC', async ({ browser }) 
     if (message.type() === 'error') consoleErrors.push(message.text());
   });
   await visual.goto('/');
+  const rendererDetail = visual.locator('[data-status="webgl-detail"]');
+  await expect(rendererDetail).toContainText('DPR 1.5');
+  await expect(rendererDetail).toContainText('HRC 1024²');
+  await visual.getByRole('button', { name: 'Modo seguro' }).click();
+  await expect(rendererDetail).toContainText('DPR 1.0');
+  await expect(rendererDetail).toContainText('HRC 512²');
   await visual.locator('[data-impulse="3"]').click();
   for (let index = 0; index < 9; index += 1) {
     await visual.locator('[data-action="test-note"]').click();
     await visual.waitForTimeout(70);
   }
 
-  const rendererDetail = visual.locator('[data-status="webgl-detail"]');
-  await expect(rendererDetail).toContainText('DPR 1.2');
-  await expect(rendererDetail).toContainText(/HRC (512|256)²/);
   await expect(rendererDetail).toContainText(/óptica (high|safe|off)/);
   expect(consoleErrors).toEqual([]);
   await context.close();

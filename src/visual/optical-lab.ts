@@ -22,9 +22,9 @@ export const OPTICAL_LAB_MATERIALS = [
   'dielectric-glass',
 ] as const;
 
-const HIGH_TARGET_HEIGHT = 360;
-const SAFE_TARGET_HEIGHT = 240;
-const MAX_TARGET_WIDTH = 768;
+// The target follows the actual drawing buffer rather than a fixed internal
+// height. Moving refractive edges therefore stay sharp at any window size.
+const SAFE_RESOLUTION_SCALE = 0.5;
 const HIGH_SAMPLES = 8;
 const SAFE_SAMPLES = 4;
 
@@ -55,6 +55,7 @@ const opticalFragmentShader = /* glsl */ `
   uniform vec2 uResolution;
   uniform float uAspect;
   uniform float uFrame;
+  uniform float uTime;
   uniform int uSampleCount;
 
   const float PI = 3.141592653589793;
@@ -90,6 +91,50 @@ const opticalFragmentShader = /* glsl */ `
     return mat2(c, s, -s, c);
   }
 
+  // Every optical primitive has a slow, independent orbit.  These functions
+  // are the one source of truth for the SDF, ray transport and appearance
+  // passes, so rays and objects always move together.
+  vec2 emitterPosition() {
+    return vec2(-4.28, 0.42) + vec2(
+      sin(uTime * 0.73) * 0.42,
+      cos(uTime * 0.91) * 0.58
+    );
+  }
+
+  vec2 mirrorPosition() {
+    return vec2(-2.23, 1.25) + vec2(
+      cos(uTime * 0.48 + 0.7) * 0.46,
+      sin(uTime * 0.62) * 0.30
+    );
+  }
+
+  float mirrorAngle() { return 1.18 + sin(uTime * 0.57) * 0.48; }
+
+  vec2 metalPosition() {
+    return vec2(-2.80, -1.30) + vec2(
+      sin(uTime * 0.64 + 1.8) * 0.52,
+      cos(uTime * 0.45 + 0.4) * 0.28
+    );
+  }
+
+  float metalAngle() { return 0.16 + cos(uTime * 0.70) * 0.34; }
+
+  vec2 lensOffset() {
+    return vec2(
+      sin(uTime * 0.41 + 0.4) * 0.48,
+      sin(uTime * 0.53 + 2.1) * 0.34
+    );
+  }
+
+  vec2 diffuseBlockPosition() {
+    return vec2(3.72, 1.20) + vec2(
+      cos(uTime * 0.38 + 1.4) * 0.38,
+      sin(uTime * 0.51 + 0.8) * 0.42
+    );
+  }
+
+  float diffuseBlockAngle() { return -0.12 + sin(uTime * 0.44) * 0.34; }
+
   float sdCircle(vec2 p, vec2 centre, float radius) {
     return length(p - centre) - radius;
   }
@@ -101,28 +146,29 @@ const opticalFragmentShader = /* glsl */ `
   }
 
   float emitterSdf(vec2 p) {
-    return sdCircle(p, vec2(-4.28, 0.42), 0.34);
+    return sdCircle(p, emitterPosition(), 0.34);
   }
 
   float mirrorSdf(vec2 p) {
-    return sdBox(p, vec2(-2.23, 1.25), vec2(0.075, 0.92), 1.18);
+    return sdBox(p, mirrorPosition(), vec2(0.075, 0.92), mirrorAngle());
   }
 
   float metalSdf(vec2 p) {
-    return sdBox(p, vec2(-2.80, -1.30), vec2(0.62, 0.38), 0.16);
+    return sdBox(p, metalPosition(), vec2(0.62, 0.38), metalAngle());
   }
 
   float glassSdf(vec2 p) {
     // Intersection of two circles: a biconvex dielectric lens. Unlike a
     // simple prism, its changing normals converge transmitted rays into a
     // caustic that is easy to verify in a fixed scene.
-    float leftSurface = sdCircle(p, vec2(-0.25, 0.04), 1.08);
-    float rightSurface = sdCircle(p, vec2(0.95, 0.04), 1.08);
+    vec2 offset = lensOffset();
+    float leftSurface = sdCircle(p, vec2(-0.25, 0.04) + offset, 1.08);
+    float rightSurface = sdCircle(p, vec2(0.95, 0.04) + offset, 1.08);
     return max(leftSurface, rightSurface);
   }
 
   float diffuseBlockSdf(vec2 p) {
-    return sdBox(p, vec2(3.72, 1.20), vec2(0.52, 0.52), -0.12);
+    return sdBox(p, diffuseBlockPosition(), vec2(0.52, 0.52), diffuseBlockAngle());
   }
 
   float receiverSdf(vec2 p) {
@@ -325,17 +371,17 @@ const opticalFragmentShader = /* glsl */ `
   }
 
   vec3 forwardOpticalTransport(vec2 p) {
-    const vec2 emitter = vec2(-4.28, 0.42);
+    vec2 emitter = emitterPosition();
     float mirrorDensity = 0.0;
     float metalDensity = 0.0;
     float glassDensity = 0.0;
 
     // Perfect mirror: a narrow family of reflected rays stays sharp.
     const int mirrorRays = 14;
-    vec2 mirrorCentre = vec2(-2.23, 1.25);
-    float mirrorAngle = 1.18;
-    vec2 mirrorTangent = rotation(mirrorAngle) * vec2(0.0, 1.0);
-    vec2 mirrorBaseNormal = rotation(mirrorAngle) * vec2(1.0, 0.0);
+    vec2 mirrorCentre = mirrorPosition();
+    float mirrorOrientation = mirrorAngle();
+    vec2 mirrorTangent = rotation(mirrorOrientation) * vec2(0.0, 1.0);
+    vec2 mirrorBaseNormal = rotation(mirrorOrientation) * vec2(1.0, 0.0);
     for (int rayIndex = 0; rayIndex < mirrorRays; rayIndex++) {
       float progress = (float(rayIndex) + 0.5) / float(mirrorRays);
       vec2 hit = mirrorCentre + mirrorTangent * mix(-0.88, 0.88, progress);
@@ -350,10 +396,10 @@ const opticalFragmentShader = /* glsl */ `
     // Rough metal: the same reflection law with a deterministic angular
     // distribution produces a broad, warm lobe rather than a mirror line.
     const int metalRays = 12;
-    vec2 metalCentre = vec2(-2.80, -1.30);
-    float metalAngle = 0.16;
-    vec2 metalTangent = rotation(metalAngle) * vec2(0.0, 1.0);
-    vec2 metalNormal = rotation(metalAngle) * vec2(-1.0, 0.0);
+    vec2 metalCentre = metalPosition();
+    float metalOrientation = metalAngle();
+    vec2 metalTangent = rotation(metalOrientation) * vec2(0.0, 1.0);
+    vec2 metalNormal = rotation(metalOrientation) * vec2(-1.0, 0.0);
     for (int rayIndex = 0; rayIndex < metalRays; rayIndex++) {
       float progress = (float(rayIndex) + 0.5) / float(metalRays);
       vec2 hit = metalCentre + metalTangent * mix(-0.36, 0.36, progress)
@@ -369,8 +415,8 @@ const opticalFragmentShader = /* glsl */ `
     // Snell at both boundaries, Fresnel transmission and Beer-Lambert loss.
     const int glassRays = 24;
     const float glassIor = 1.52;
-    const vec2 leftCircle = vec2(-0.25, 0.04);
-    const vec2 rightCircle = vec2(0.95, 0.04);
+    vec2 leftCircle = vec2(-0.25, 0.04) + lensOffset();
+    vec2 rightCircle = vec2(0.95, 0.04) + lensOffset();
     const float lensRadius = 1.08;
     for (int rayIndex = 0; rayIndex < glassRays; rayIndex++) {
       float progress = (float(rayIndex) + 0.5) / float(glassRays);
@@ -470,7 +516,7 @@ const opticalFragmentShader = /* glsl */ `
     }
 
     if (local.material == MAT_METAL && metalDistance < 0.0) {
-      vec2 localPosition = rotation(-0.16) * (p - vec2(-2.80, -1.30));
+      vec2 localPosition = rotation(-metalAngle()) * (p - metalPosition());
       float brushed = 0.5 + 0.5 * sin(localPosition.y * 62.0);
       vec3 bronze = mix(vec3(0.10, 0.045, 0.018), vec3(0.78, 0.40, 0.12), brushed);
       return bronze * 0.62 + transported * vec3(1.0, 0.68, 0.32) * 1.15;
@@ -517,7 +563,7 @@ const opticalFragmentShader = /* glsl */ `
 
     // A direct halo identifies the physical emitter before the Monte Carlo
     // history has converged; it does not create reflected/refracted energy.
-    float emitterDistance = length(p - vec2(-4.28, 0.42));
+    float emitterDistance = length(p - emitterPosition());
     transported += vec3(1.0, 0.56, 0.20)
       * 0.018 / max(emitterDistance * emitterDistance, 0.08);
 
@@ -563,10 +609,9 @@ const displayFragmentShader = /* glsl */ `
       + texture(uSource, vUv + vec2(0.0, uTexel.y)).rgb
       + texture(uSource, vUv - vec2(0.0, uTexel.y)).rgb
     ) * 0.25;
-    // The lab is static: a small reconstruction average is a much better
-    // trade than a sharpened Monte-Carlo speckle. It is not bloom and never
-    // creates extra light; it only resolves the bounded internal grid.
-    vec3 resolved = mix(centre, neighbours, 0.34);
+    // A light spatial resolve suppresses the remaining per-frame sampling
+    // noise without leaving temporal trails behind the moving optics.
+    vec3 resolved = mix(centre, neighbours, 0.22);
     outColour = vec4(clamp(resolved, 0.0, 1.0), 1.0);
   }
 `;
@@ -610,8 +655,6 @@ export class OpticalLab {
   private quality: OpticalLabQuality = 'high';
   private width = 1;
   private height = 1;
-  private frameIndex = 0;
-  private resetHistory = true;
   private lastCpuTimeMs = 0;
   private active = false;
 
@@ -622,6 +665,7 @@ export class OpticalLab {
       uResolution: { value: new THREE.Vector2(1, 1) },
       uAspect: { value: 1 },
       uFrame: { value: 0 },
+      uTime: { value: 0 },
       uSampleCount: { value: HIGH_SAMPLES },
     });
     this.accumulateMaterial = makeMaterial(accumulateFragmentShader, {
@@ -646,7 +690,8 @@ export class OpticalLab {
       width: this.width,
       height: this.height,
       samplesPerPixel,
-      accumulatedFrames: this.frameIndex,
+      // Dynamic geometry cannot accumulate samples from previous frames.
+      accumulatedFrames: this.active ? 1 : 0,
       drawCalls: this.active ? 3 : 0,
       cpuTimeMs: this.lastCpuTimeMs,
       targetMemoryBytes: this.width * this.height * 8 * 3,
@@ -660,16 +705,9 @@ export class OpticalLab {
   }
 
   setSize(canvasWidth: number, canvasHeight: number): void {
-    const safeHeight = Math.max(1, canvasHeight);
-    const aspect = Math.max(0.5, canvasWidth / safeHeight);
-    const targetHeight = this.quality === 'high'
-      ? HIGH_TARGET_HEIGHT
-      : SAFE_TARGET_HEIGHT;
-    const nextHeight = Math.max(1, Math.min(targetHeight, Math.round(safeHeight)));
-    const nextWidth = Math.max(
-      1,
-      Math.min(MAX_TARGET_WIDTH, Math.round(nextHeight * aspect)),
-    );
+    const scale = this.quality === 'high' ? 1 : SAFE_RESOLUTION_SCALE;
+    const nextWidth = Math.max(1, Math.round(canvasWidth * scale));
+    const nextHeight = Math.max(1, Math.round(canvasHeight * scale));
     if (nextWidth === this.width && nextHeight === this.height) return;
     this.width = nextWidth;
     this.height = nextHeight;
@@ -677,8 +715,8 @@ export class OpticalLab {
   }
 
   reset(): void {
-    this.frameIndex = 0;
-    this.resetHistory = true;
+    // Kept as the public reset hook used by the renderer. There is no
+    // temporal history to clear while the scene is in motion.
   }
 
   setActive(active: boolean): void {
@@ -686,7 +724,7 @@ export class OpticalLab {
     this.active = active;
   }
 
-  render(): void {
+  render(elapsed: number): void {
     if (!this.active) return;
     const startedAt = performance.now();
     const previousTarget = this.renderer.getRenderTarget();
@@ -695,7 +733,11 @@ export class OpticalLab {
     const previousAutoClear = this.renderer.autoClear;
     const writeIndex = 1 - this.historyReadIndex;
 
-    this.opticalMaterial.uniforms.uFrame.value = this.frameIndex;
+    // Keep the sampling pattern deterministic while the geometry moves. This
+    // avoids temporal grain and, unlike the previous static lab, history is
+    // not mixed into a new physical state.
+    this.opticalMaterial.uniforms.uFrame.value = 0;
+    this.opticalMaterial.uniforms.uTime.value = elapsed;
     this.opticalMaterial.uniforms.uSampleCount.value =
       this.quality === 'high' ? HIGH_SAMPLES : SAFE_SAMPLES;
     this.renderPass(this.opticalMaterial, this.rawTarget, true);
@@ -704,7 +746,7 @@ export class OpticalLab {
     this.accumulateMaterial.uniforms.uHistory.value =
       this.historyTargets[this.historyReadIndex].texture;
     this.accumulateMaterial.uniforms.uHistoryWeight.value =
-      this.resetHistory ? 0 : 0.98;
+      0;
     this.renderPass(this.accumulateMaterial, this.historyTargets[writeIndex], false);
     this.historyReadIndex = writeIndex;
 
@@ -721,8 +763,6 @@ export class OpticalLab {
     this.renderer.setRenderTarget(previousTarget);
     this.renderer.setClearColor(previousColour, previousAlpha);
     this.renderer.autoClear = previousAutoClear;
-    this.frameIndex += 1;
-    this.resetHistory = false;
     this.lastCpuTimeMs = performance.now() - startedAt;
   }
 
@@ -749,7 +789,7 @@ export class OpticalLab {
 
   private resizeTargets(): void {
     const canvas = this.renderer.domElement;
-    this.setSize(canvas.clientWidth || canvas.width, canvas.clientHeight || canvas.height);
+    this.setSize(canvas.width || canvas.clientWidth, canvas.height || canvas.clientHeight);
     this.reset();
   }
 

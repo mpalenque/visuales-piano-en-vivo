@@ -3,7 +3,7 @@
 Los impulsos 03 y 05 conservan Amitabha HRC como transporte difuso principal y
 agregan una capa óptica direccional pequeña para espejo, vidrio y caústicas.
 No hay un pase fullscreen, acumulación temporal ni render targets adicionales.
-Los bordes combinan MSAA, supersampling 1.2× y cobertura analítica con
+Los bordes combinan MSAA, supersampling adaptativo de 1.5–2× y cobertura analítica con
 derivadas; la salida HRC se resuelve con cuatro taps dentro del pase existente.
 
 ## Transporte

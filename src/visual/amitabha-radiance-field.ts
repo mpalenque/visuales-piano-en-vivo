@@ -6,8 +6,11 @@ import * as THREE from 'three';
 // HRC requires a square power-of-two field. The visible 16:10 region is
 // represented inside that square by AMITABHA_WORLD_BOUNDS.
 const MAX_BODIES = 48;
-const HIGH_FIELD_EXTENT = 512;
-const SAFE_FIELD_EXTENT = 256;
+// Full-HD projection exposes the transport texels very quickly at 512². High
+// quality therefore runs at 1024², while the fallback keeps the former high
+// resolution instead of dropping all the way to a visibly blocky 256² field.
+const HIGH_FIELD_EXTENT = 1024;
+const SAFE_FIELD_EXTENT = 512;
 const FRUSTUM_COUNT = 4;
 const DEFAULT_FRUSTUMS_PER_STEP = FRUSTUM_COUNT;
 
@@ -637,18 +640,26 @@ const displayFragmentShader = /* glsl */ `
   uniform vec2 uFieldTexel;
   uniform float uResolveSharpness;
 
-  vec3 acesToneMap(vec3 colour) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return clamp(
-      (colour * (a * colour + b))
-      / (colour * (c * colour + d) + e),
-      0.0,
-      1.0
-    );
+  const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+  float colourLuma(vec3 colour) {
+    return dot(max(colour, vec3(0.0)), LUMA);
+  }
+
+  vec3 toneMapPreservingHue(vec3 colour) {
+    colour = max(colour, vec3(0.0));
+    float sourceLuminance = colourLuma(colour);
+    if (sourceLuminance <= 0.000001) return vec3(0.0);
+
+    // Compress intensity once, from luminance, rather than independently per
+    // RGB channel. Per-channel filmic curves bend saturated light toward
+    // white/yellow and make the four HRC frustums look colour-separated.
+    float mappedLuminance = sourceLuminance / (1.0 + sourceLuminance);
+    vec3 mapped = colour * (mappedLuminance / sourceLuminance);
+
+    // Bring out-of-gamut highlights back as a uniform scale so hue survives.
+    float peak = max(max(mapped.r, mapped.g), mapped.b);
+    return peak > 1.0 ? mapped / peak : mapped;
   }
 
   void main() {
@@ -667,7 +678,8 @@ const displayFragmentShader = /* glsl */ `
     vec3 radiance = vec3(0.0);
     if (!outsideField) {
       // Edge-adaptive 3x3 reconstruction. It smooths along radiance edges,
-      // not across them, then restores local contrast lost by 512² transport.
+      // not across them, then restores local contrast lost by finite-resolution
+      // transport when the field is enlarged to the display.
       vec2 dx = vec2(uFieldTexel.x, 0.0);
       vec2 dy = vec2(0.0, uFieldTexel.y);
       vec3 center = texture(uIrradiance, sampleUv).rgb;
@@ -696,16 +708,41 @@ const displayFragmentShader = /* glsl */ `
         northWest + northEast + southWest + southEast
       ) * 0.25;
       vec3 localBlur = center * 0.38 + cardinal * 0.42 + diagonal * 0.2;
-      vec3 reconstructed = mix(center, directional, 0.18);
-      radiance = max(
-        reconstructed + (reconstructed - localBlur) * uResolveSharpness,
-        vec3(0.0)
+      vec3 reconstructed = mix(center, directional, 0.24);
+      float edgeStrength = max(horizontalEdge, verticalEdge);
+      float flatRegion = 1.0 - smoothstep(0.03, 0.22, edgeStrength);
+
+      // The transport grid contains small chroma differences between its four
+      // rotated frustums. Smooth those differences, but restore edge detail
+      // only from luminance so sharpening cannot manufacture RGB fringes. In
+      // smooth light gradients, resolve more aggressively to hide the HRC
+      // phase pattern; silhouettes keep the directional reconstruction.
+      float smoothing = 0.18 + 0.22 * flatRegion;
+      vec3 chromaStable = mix(reconstructed, localBlur, smoothing);
+      float reconstructedLuma = colourLuma(reconstructed);
+      float blurredLuma = colourLuma(localBlur);
+      float stableLuma = colourLuma(chromaStable);
+      float baseLuma = mix(reconstructedLuma, blurredLuma, 0.18 * flatRegion);
+      float adaptiveSharpness = uResolveSharpness * (1.0 - 0.75 * flatRegion);
+      float resolvedLuma = max(
+        baseLuma
+          + (reconstructedLuma - blurredLuma) * adaptiveSharpness,
+        0.0
       );
-      vec3 localMaximum = max(
-        max(max(center, cardinal), diagonal),
-        vec3(0.0001)
+      radiance = stableLuma > 0.000001
+        ? chromaStable * (resolvedLuma / stableLuma)
+        : vec3(0.0);
+
+      // Clamp overshoot by luminance, not per channel, to retain the hue of
+      // saturated emitters at high-contrast shadow boundaries.
+      float localMaximumLuma = max(
+        max(colourLuma(center), colourLuma(cardinal)),
+        max(colourLuma(diagonal), 0.0001)
       );
-      radiance = min(radiance, localMaximum * 1.16);
+      float resolvedOutputLuma = colourLuma(radiance);
+      if (resolvedOutputLuma > localMaximumLuma * 1.12) {
+        radiance *= localMaximumLuma * 1.12 / resolvedOutputLuma;
+      }
     }
     vec3 background = uBackgroundEnabled > 0.5
       ? texture(uBackgroundTexture, vUv).rgb
@@ -717,8 +754,8 @@ const displayFragmentShader = /* glsl */ `
       background * vec3(0.34, 0.54, 0.84),
       uBackgroundOpacity
     );
-    vec3 exposed = background + radiance * 1.7;
-    vec3 mapped = acesToneMap(exposed);
+    vec3 exposed = background + radiance * 1.45;
+    vec3 mapped = toneMapPreservingHue(exposed);
     outColour = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
   }
 `;

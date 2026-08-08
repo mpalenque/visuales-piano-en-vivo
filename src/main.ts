@@ -79,7 +79,7 @@ if (panelOnly) {
     radianceCompositionFocus: '—',
     radianceCompositionPalette: '—',
     radianceCompositionEmitterCount: 0,
-    hrcResolution: 512, hrcUpdateHz: 0, hrcFrustumsPerFrame: 4, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
+    hrcResolution: 1024, hrcUpdateHz: 0, hrcFrustumsPerFrame: 4, hrcTargetMemoryBytes: 0, hrcDrawCalls: 0,
     causticsActive: false, causticsQuality: 'high', causticsEmitterCount: 0,
     causticsMaterialCount: 0, causticsRayCount: 0, causticsHitCount: 0,
     causticsPointCount: 0, causticsUpdateHz: 0, causticsCpuTimeMs: 0,
